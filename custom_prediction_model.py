@@ -1,4 +1,5 @@
-# 2. Import Libraries
+# @title LSTMTrader
+
 import ccxt
 import pandas as pd
 import numpy as np
@@ -263,6 +264,113 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=0
     
     return training_losses, validation_losses
 
+class PaperTradingSimulator:
+    def __init__(self, initial_capital=100000, max_position_size=0.2):
+        self.initial_capital = initial_capital
+        self.capital = initial_capital
+        self.max_position_size = max_position_size
+        self.positions = {}
+        self.trades = []
+        self.trade_history = []
+    
+    def simulate_trading(self, predictions, confidence_intervals, actual_prices, 
+                        symbols, timestamps):
+        """Run paper trading simulation"""
+        portfolio_values = [self.initial_capital]
+        
+        for t in range(len(predictions)-1):
+            # Calculate position sizes based on prediction confidence
+            for i, symbol in enumerate(symbols):
+                pred_change = (predictions[t+1][i] - predictions[t][i]) / predictions[t][i]
+                ci_width = (confidence_intervals[1][t][i] - confidence_intervals[0][t][i])
+                confidence_score = 1 - (ci_width / predictions[t][i])
+                
+                # Position sizing
+                position_params = calculate_position_size(
+                    predictions[t][i],
+                    (confidence_intervals[0][t][i], confidence_intervals[1][t][i])
+                )
+                
+                # Trading decision
+                if abs(pred_change) > 0.001:  # Minimum change threshold
+                    if pred_change > 0 and confidence_score > 0.7:
+                        self._open_position(symbol, actual_prices[t][i], 
+                                         position_params['position_size'],
+                                         timestamps[t])
+                    elif pred_change < 0:
+                        self._close_position(symbol, actual_prices[t][i],
+                                          timestamps[t])
+            
+            # Calculate portfolio value
+            portfolio_value = self.capital
+            for symbol, pos in self.positions.items():
+                portfolio_value += pos['size'] * actual_prices[t][symbols.index(symbol)]
+            portfolio_values.append(portfolio_value)
+        
+        return {
+            'final_capital': portfolio_values[-1],
+            'returns': (portfolio_values[-1] - self.initial_capital) / self.initial_capital,
+            'portfolio_values': portfolio_values,
+            'trade_history': self.trade_history,
+            'sharpe_ratio': self._calculate_sharpe_ratio(portfolio_values),
+            'max_drawdown': self._calculate_max_drawdown(portfolio_values)
+        }
+    
+    def _open_position(self, symbol, price, size, timestamp):
+        if symbol not in self.positions:
+            position_value = self.capital * size * self.max_position_size
+            position_size = position_value / price
+            
+            if position_value <= self.capital:
+                self.positions[symbol] = {
+                    'size': position_size,
+                    'entry_price': price,
+                    'entry_time': timestamp
+                }
+                self.capital -= position_value
+                self.trade_history.append({
+                    'type': 'buy',
+                    'symbol': symbol,
+                    'price': price,
+                    'size': position_size,
+                    'value': position_value,
+                    'timestamp': timestamp
+                })
+    
+    def _close_position(self, symbol, price, timestamp):
+        if symbol in self.positions:
+            position = self.positions[symbol]
+            position_value = position['size'] * price
+            self.capital += position_value
+            
+            profit = position_value - (position['size'] * position['entry_price'])
+            self.trade_history.append({
+                'type': 'sell',
+                'symbol': symbol,
+                'price': price,
+                'size': position['size'],
+                'value': position_value,
+                'profit': profit,
+                'timestamp': timestamp
+            })
+            del self.positions[symbol]
+    
+    def _calculate_sharpe_ratio(self, portfolio_values, risk_free_rate=0.02):
+        returns = np.diff(portfolio_values) / portfolio_values[:-1]
+        excess_returns = returns - risk_free_rate/252
+        return np.sqrt(252) * np.mean(excess_returns) / np.std(excess_returns)
+    
+    def _calculate_max_drawdown(self, portfolio_values):
+        peak = portfolio_values[0]
+        max_drawdown = 0
+        
+        for value in portfolio_values[1:]:
+            if value > peak:
+                peak = value
+            drawdown = (peak - value) / peak
+            max_drawdown = max(max_drawdown, drawdown)
+        
+        return max_drawdown
 
 # Enhanced Multi-step Forecast Function
 def multi_step_forecast(model, dataset, initial_sequence, steps=48):
@@ -427,6 +535,24 @@ def calculate_position_size(prediction, confidence_interval, max_position=1.0, b
         'trend_strength': market_trend
     }
 
+
+def prepare_trading_data(data, predictions, ci, scaler):
+    """Prepare data for paper trading simulation"""
+    # Get close prices from original data
+    close_prices = data[data['symbol'] == 'BTC/USDT']['close'].values
+    eth_prices = data[data['symbol'] == 'ETH/USDT']['close'].values
+    bnb_prices = data[data['symbol'] == 'BNB/USDT']['close'].values
+    
+    # Stack actual prices
+    actual_prices = np.column_stack((close_prices, eth_prices, bnb_prices))
+    
+    # Inverse transform predictions
+    pred_transformed = scaler.inverse_transform(predictions)
+    ci_lower_transformed = scaler.inverse_transform(ci[0])
+    ci_upper_transformed = scaler.inverse_transform(ci[1])
+    
+    return actual_prices, pred_transformed, (ci_lower_transformed, ci_upper_transformed)
+
 # 7. Main Execution
 def main():
     # Fetch and prepare data
@@ -487,14 +613,33 @@ def main():
     predictions = multi_step_forecast(model, dataset, initial_sequence, steps=72)
     mean, ci = calculate_confidence_interval(predictions)
     
-    # Plot predictions with confidence intervals
+    # Prepare data for trading simulation
+    actual_prices, pred_transformed, ci_transformed = prepare_trading_data(
+        data, predictions, ci, dataset.scaler
+    )
+    
+    # Initialize and run paper trading simulation
+    simulator = PaperTradingSimulator()
+    trading_results = simulator.simulate_trading(
+        pred_transformed,
+        ci_transformed,
+        actual_prices,
+        symbols=['BTC/USDT', 'ETH/USDT', 'BNB/USDT'],
+        timestamps=data['timestamp'].values
+    )
+    
+    print("\nPaper Trading Results:")
+    print(f"Final Capital: ${trading_results['final_capital']:,.2f}")
+    print(f"Total Return: {trading_results['returns']*100:.2f}%")
+    print(f"Sharpe Ratio: {trading_results['sharpe_ratio']:.2f}")
+    print(f"Maximum Drawdown: {trading_results['max_drawdown']*100:.2f}%")
+    
+    # Plot strategy performance
     plt.figure(figsize=(12, 6))
-    hours = np.arange(len(mean))
-    plt.plot(hours, mean[:, 3], label='Predicted Close Price')
-    plt.fill_between(hours, ci[0][:, 3], ci[1][:, 3], alpha=0.2, label='95% CI')
-    plt.title('72-Hour Price Prediction with Confidence Intervals')
-    plt.xlabel('Hours')
-    plt.ylabel('Price')
+    plt.plot(trading_results['portfolio_values'], label='Portfolio Value')
+    plt.title('Paper Trading Performance')
+    plt.xlabel('Time')
+    plt.ylabel('Portfolio Value ($)')
     plt.legend()
     plt.show()
 
