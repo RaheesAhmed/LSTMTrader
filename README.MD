@@ -12,7 +12,19 @@ A sophisticated cryptocurrency trading system that uses LSTM and advanced techni
 - Comprehensive trading metrics and evaluation
 - Interactive visualizations
 
-## Requirements
+## Clone the repository
+
+```bash
+git clone https://github.com/RaheesAhmed/LSTMTrader.git
+```
+
+## cd into the repository
+
+```bash
+cd LSTMTrader
+```
+
+## Install the dependencies
 
 ```bash
 pip install -r requirements.txt
