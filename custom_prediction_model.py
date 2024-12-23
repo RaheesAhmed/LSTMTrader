@@ -54,6 +54,7 @@ def fetch_construction_data(symbols=["BTC/USDT","ETH/USDT","BNB/USDT"],
     
     final_data = pd.concat(all_data, axis=0)
     print(f"Final dataset shape: {final_data.shape}")
+    final_data = final_data.set_index('timestamp') # Set 'timestamp' as index
     return final_data
 
 
@@ -266,161 +267,183 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=0
 
 
 class EnhancedPaperTradingSimulator:
-    def __init__(self, initial_capital=100000):
+    def __init__(self, initial_capital=100000, risk_manager=None, regime_detector=None,
+                 regime_adapter=None, performance_analytics=None):
         self.initial_capital = initial_capital
         self.capital = initial_capital
         self.positions = {}
         self.trade_history = []
         
         # Initialize components
-        self.risk_manager = RiskManager(
+        self.risk_manager = risk_manager or RiskManager(
             trailing_stop_pct=0.02,
             max_drawdown_pct=0.15,
             risk_per_trade=0.02,
             volatility_scaling=True
         )
         
-        self.trade_rules = TradeRules(
-            confidence_threshold=0.7,
-            min_edge=0.01,
-            max_holding_period=48,
-            trend_confirmation=True
-        )
+        self.regime_detector = regime_detector or MarketRegimeDetector()
+        self.regime_adapter = regime_adapter or RegimeStrategyAdapter()
+        self.performance_analytics = performance_analytics or PerformanceAnalytics()
         
-        self.analytics = PerformanceAnalytics()
-        
-    def simulate_trading(self, data, predictions, confidence_intervals, timestamps):
+    def simulate_trading(self, data, predictions, confidence_intervals, timestamps, symbols):
         """Enhanced trading simulation with all components"""
         portfolio_values = [self.initial_capital]
         current_regime = None
         
+        # Ensure data has technical indicators
+        if 'rsi' not in data.columns:
+            data = add_technical_indicators(data.copy())
+        
         for t in range(len(predictions)-1):
             # Update market regime
-            current_regime = self.detect_market_regime(data, t)
+            current_regime = self.regime_detector.detect_regime(data.iloc[max(0, t-20):t+1])
             
             # Adjust strategy based on regime
-            self.adjust_strategy_parameters(current_regime)
+            strategy_params = self.regime_adapter.adapt_parameters(current_regime)
             
             # Portfolio optimization
             optimal_allocations = self.optimize_portfolio(
                 predictions[t],
                 confidence_intervals,
-                data['volatility'].iloc[t]
+                data['atr'].iloc[t] if 'atr' in data else 0.02  # Default volatility if ATR not available
             )
             
             # Process each symbol
-            for symbol in data['symbol'].unique():
+            for symbol in symbols:
+                symbol_data = data[data['symbol'] == symbol].iloc[t] if 'symbol' in data else data.iloc[t]
                 position_size = optimal_allocations.get(symbol, 0)
                 
                 # Check entry conditions
                 if symbol not in self.positions:
-                    if self.trade_rules.check_entry_conditions(
+                    if self.check_entry_conditions(
                         symbol,
-                        predictions[t+1][symbol],
-                        confidence_intervals[t+1][symbol],
-                        data.loc[t, data['symbol'] == symbol]['close'].values[0],
-                        self.get_technical_indicators(data, t, symbol)
+                        predictions[t+1],
+                        confidence_intervals,
+                        symbol_data['close'],
+                        symbol_data
                     ):
                         self._open_position(
                             symbol,
-                            data.loc[t, data['symbol'] == symbol]['close'].values[0],
+                            symbol_data['close'],
                             position_size,
                             timestamps[t]
                         )
                 
                 # Check exit conditions for existing positions
                 elif symbol in self.positions:
-                    exit_signal, reason = self.trade_rules.check_exit_conditions(
+                    exit_signal = self.check_exit_conditions(
                         symbol,
                         timestamps[t],
                         self.positions[symbol],
-                        predictions[t+1][symbol],
-                        confidence_intervals[t+1][symbol],
-                        self.risk_manager
+                        predictions[t+1],
+                        confidence_intervals,
+                        symbol_data['close']
                     )
                     
                     if exit_signal:
                         self._close_position(
                             symbol,
-                            data.loc[t, data['symbol'] == symbol]['close'].values[0],
+                            symbol_data['close'],
                             timestamps[t],
-                            reason
+                            "Strategy exit signal"
                         )
             
             # Calculate and record portfolio value
             portfolio_value = self.calculate_portfolio_value(data, t)
-            self.analytics.add_portfolio_value(portfolio_value, timestamps[t])
+            portfolio_values.append(portfolio_value)
+            self.performance_analytics.add_portfolio_value(portfolio_value, timestamps[t])
             
             # Check global risk limits
             if self.risk_manager.check_drawdown_limit(portfolio_value, self.initial_capital):
                 print(f"Maximum drawdown limit reached at {timestamps[t]}")
                 self.close_all_positions(data, t, timestamps[t])
-            
-        # Calculate final performance metrics
-        performance_metrics = self.analytics.calculate_metrics()
-        self.analytics.plot_performance()
+                break
+        
+        # Calculate final results
+        final_capital = portfolio_values[-1]
+        returns = (final_capital - self.initial_capital) / self.initial_capital
+        
+        # Calculate metrics
+        metrics = self.performance_analytics.calculate_metrics()
         
         return {
-            'metrics': performance_metrics,
+            'final_capital': final_capital,
+            'returns': returns,
+            'portfolio_values': portfolio_values,
             'trade_history': self.trade_history,
-            'portfolio_values': self.analytics.portfolio_values
+            'metrics': metrics
         }
     
-    def detect_market_regime(self, data, t):
-        """Detect current market regime using volatility and trend"""
-        volatility = data['volatility'].iloc[t]
-        trend = data['trend'].iloc[t]
-        
-        if volatility > data['volatility'].mean() * 1.5:
-            return 'high_volatility'
-        elif trend > 0:
-            return 'uptrend'
-        elif trend < 0:
-            return 'downtrend'
-        else:
-            return 'range_bound'
-    
-    def adjust_strategy_parameters(self, regime):
-        """Adjust strategy parameters based on market regime"""
-        if regime == 'high_volatility':
-            self.risk_manager.risk_per_trade *= 0.5
-            self.trade_rules.confidence_threshold *= 1.2
-        elif regime == 'uptrend':
-            self.risk_manager.trailing_stop_pct *= 1.5
-            self.trade_rules.min_edge *= 0.8
-        elif regime == 'downtrend':
-            self.risk_manager.risk_per_trade *= 0.7
-            self.trade_rules.max_holding_period *= 0.5
-    
-    def optimize_portfolio(self, predictions, confidence_intervals, volatility):
-        """Optimize portfolio allocation using Modern Portfolio Theory"""
-        n_assets = len(predictions)
-        returns = np.array([(p - c[0])/c[0] for p, c in zip(predictions, confidence_intervals)])
-        
-        # Calculate covariance matrix
-        cov_matrix = np.eye(n_assets) * volatility
-        
-        # Optimize using Sharpe Ratio
-        def neg_sharpe_ratio(weights):
-            port_return = np.sum(returns * weights)
-            port_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-            return -(port_return - 0.02) / port_vol if port_vol != 0 else -float('inf')
-        
-        # Constraints
-        constraints = (
-            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},  # weights sum to 1
-            {'type': 'ineq', 'fun': lambda x: x}  # non-negative weights
+    def check_entry_conditions(self, symbol, prediction, confidence_intervals, current_price, technical_data):
+        """Check if entry conditions are met using technical indicators"""
+        # Basic trend check
+        trend_up = (
+            technical_data['sma_20'] > technical_data['sma_50']
+            if 'sma_20' in technical_data and 'sma_50' in technical_data
+            else True
         )
         
-        # Optimize
-        result = minimize(neg_sharpe_ratio,
-                        x0=np.array([1/n_assets]*n_assets),
-                        method='SLSQP',
-                        constraints=constraints)
+        # Momentum check
+        good_momentum = (
+            30 < technical_data['rsi'] < 70
+            if 'rsi' in technical_data
+            else True
+        )
         
-        return dict(zip(range(n_assets), result.x))
+        # Volatility check
+        reasonable_volatility = (
+            technical_data['atr'] < current_price * 0.03
+            if 'atr' in technical_data
+            else True
+        )
+        
+        # Price prediction check
+        predicted_return = (prediction - current_price) / current_price
+        good_prediction = abs(predicted_return) > 0.01
+        
+        return trend_up and good_momentum and reasonable_volatility and good_prediction
+    
+    def check_exit_conditions(self, symbol, timestamp, position, prediction, confidence_intervals, current_price):
+        """Check if exit conditions are met"""
+        # Calculate holding time
+        holding_time = (timestamp - position['entry_time']).total_seconds() / 3600
+        
+        # Check maximum holding period (48 hours)
+        if holding_time > 48:
+            return True
+        
+        # Check trailing stop
+        if self.risk_manager.update_trailing_stop(symbol, current_price, position):
+            return True
+        
+        # Check prediction reversal
+        if prediction < position['entry_price']:
+            return True
+        
+        return False
+    
+    def optimize_portfolio(self, predictions, confidence_intervals, volatility):
+        """Simple portfolio optimization based on predictions and risk"""
+        n_assets = len(predictions) if isinstance(predictions, (list, np.ndarray)) else 1
+        equal_weight = 1.0 / n_assets
+        
+        # For now, return equal weights (can be enhanced with proper optimization)
+        return {i: equal_weight for i in range(n_assets)}
+    
+    def calculate_portfolio_value(self, data, t):
+        """Calculate current portfolio value"""
+        portfolio_value = self.capital
+        
+        for symbol, position in self.positions.items():
+            symbol_data = data[data['symbol'] == symbol].iloc[t] if 'symbol' in data else data.iloc[t]
+            current_price = symbol_data['close']
+            portfolio_value += position['size'] * current_price
+        
+        return portfolio_value
     
     def _open_position(self, symbol, price, size, timestamp):
+        """Open a new position"""
         position_value = self.capital * size
         position_size = position_value / price
         
@@ -441,9 +464,10 @@ class EnhancedPaperTradingSimulator:
                 'timestamp': timestamp
             }
             self.trade_history.append(trade)
-            self.analytics.add_trade(trade)
+            self.performance_analytics.add_trade(trade)
     
     def _close_position(self, symbol, price, timestamp, reason=""):
+        """Close an existing position"""
         if symbol in self.positions:
             position = self.positions[symbol]
             position_value = position['size'] * price
@@ -462,19 +486,20 @@ class EnhancedPaperTradingSimulator:
                 'reason': reason
             }
             self.trade_history.append(trade)
-            self.analytics.add_trade(trade)
+            self.performance_analytics.add_trade(trade)
             
             del self.positions[symbol]
     
-    def calculate_portfolio_value(self, data, t):
-        """Calculate current portfolio value"""
-        portfolio_value = self.capital
-        
-        for symbol, position in self.positions.items():
-            current_price = data.loc[t, data['symbol'] == symbol]['close'].values[0]
-            portfolio_value += position['size'] * current_price
-        
-        return portfolio_value
+    def close_all_positions(self, data, t, timestamp):
+        """Close all open positions"""
+        for symbol in list(self.positions.keys()):
+            symbol_data = data[data['symbol'] == symbol].iloc[t] if 'symbol' in data else data.iloc[t]
+            self._close_position(
+                symbol,
+                symbol_data['close'],
+                timestamp,
+                "Risk management - closing all positions"
+            )
 
 class WalkForwardOptimizer:
     def __init__(self, train_window=30, test_window=7, step_size=7):
@@ -547,6 +572,9 @@ class MarketRegimeDetector:
         
     def detect_regime(self, data):
         """Detect market regime using multiple indicators"""
+        # First ensure data has all required indicators
+        data = add_technical_indicators(data.copy())
+        
         # Calculate regime indicators
         volatility = self._calculate_volatility(data)
         trend = self._calculate_trend(data)
@@ -575,35 +603,34 @@ class MarketRegimeDetector:
     
     def _calculate_trend(self, data):
         """Calculate trend regime"""
-        sma_short = data['close'].rolling(20).mean()
-        sma_long = data['close'].rolling(50).mean()
-        macd = data.ta.macd()
+        sma_short = data['sma_20']
+        sma_long = data['sma_50']
+        macd = data['macd']
         
         return {
-            'strong_uptrend': (sma_short > sma_long) & (macd['MACD_12_26_9'] > 0),
-            'weak_uptrend': (sma_short > sma_long) & (macd['MACD_12_26_9'] <= 0),
+            'strong_uptrend': (sma_short > sma_long) & (macd > 0),
+            'weak_uptrend': (sma_short > sma_long) & (macd <= 0),
             'sideways': abs(sma_short - sma_long) < data['close'].std(),
-            'weak_downtrend': (sma_short < sma_long) & (macd['MACD_12_26_9'] >= 0),
-            'strong_downtrend': (sma_short < sma_long) & (macd['MACD_12_26_9'] < 0)
+            'weak_downtrend': (sma_short < sma_long) & (macd >= 0),
+            'strong_downtrend': (sma_short < sma_long) & (macd < 0)
         }
     
     def _calculate_momentum(self, data):
         """Calculate momentum regime"""
-        rsi = data.ta.rsi()
-        stoch = data.ta.stoch()
+        rsi = data['rsi']
+        stoch_k = data['stoch_k']
         
         return {
-            'overbought': (rsi > 70) & (stoch['STOCHk_14_3_3'] > 80),
-            'bullish_momentum': (rsi > 50) & (stoch['STOCHk_14_3_3'] > 50),
+            'overbought': (rsi > 70) & (stoch_k > 80),
+            'bullish_momentum': (rsi > 50) & (stoch_k > 50),
             'neutral_momentum': (45 <= rsi) & (rsi <= 55),
-            'bearish_momentum': (rsi < 50) & (stoch['STOCHk_14_3_3'] < 50),
-            'oversold': (rsi < 30) & (stoch['STOCHk_14_3_3'] < 20)
+            'bearish_momentum': (rsi < 50) & (stoch_k < 50),
+            'oversold': (rsi < 30) & (stoch_k < 20)
         }
     
     def _calculate_volume_profile(self, data):
         """Calculate volume profile regime"""
         volume_sma = data['volume'].rolling(self.window_size).mean()
-        obv = data.ta.obv()
         
         return {
             'high_volume_bullish': (data['volume'] > volume_sma) & (data['close'] > data['open']),
@@ -1146,7 +1173,8 @@ class UnifiedTradingSystem:
         
     def run_simulation(self, data, model, prediction_steps=72):
         """Run complete trading simulation with all components"""
-        # Prepare dataset
+        # Prepare dataset with technical indicators
+        data = add_technical_indicators(data.copy())
         dataset = ConstructionDataset(data)
         
         # Generate predictions with confidence intervals
@@ -1214,6 +1242,8 @@ class UnifiedTradingSystem:
     
     def _analyze_regime_performance(self, trade_history):
         """Analyze performance metrics by market regime"""
+        from collections import defaultdict
+        
         regime_trades = defaultdict(list)
         
         for trade in trade_history:
