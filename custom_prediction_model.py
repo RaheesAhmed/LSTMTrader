@@ -13,7 +13,127 @@ import pandas_ta as ta  # Added for technical indicators
 import optuna
 from sklearn.metrics import r2_score
 import scipy.stats as st
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter
+from loguru import logger
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from torch.amp import GradScaler
+import torch.multiprocessing as mp
 
+
+
+# Set up logger
+logger.add("trading_system.log", rotation="500 MB")
+
+# Check for GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {device}")
+
+def plot_training_curves(train_losses, val_losses):
+    """Plot training curves using Plotly"""
+    fig = make_subplots(rows=1, cols=1)
+    
+    fig.add_trace(
+        go.Scatter(y=train_losses, name="Training Loss", line=dict(color='blue')),
+        row=1, col=1
+    )
+    
+    fig.add_trace(
+        go.Scatter(y=val_losses, name="Validation Loss", line=dict(color='red')),
+        row=1, col=1
+    )
+    
+    fig.update_layout(
+        title="Training and Validation Losses",
+        xaxis_title="Epoch",
+        yaxis_title="Loss",
+        hovermode='x unified',
+        template='plotly_dark'
+    )
+    
+    return fig
+
+def plot_predictions(predictions, actual_prices=None):
+    """Plot predictions using Plotly"""
+    fig = make_subplots(rows=1, cols=1)
+    
+    fig.add_trace(
+        go.Scatter(y=predictions, name="Predictions", line=dict(color='green')),
+        row=1, col=1
+    )
+    
+    if actual_prices is not None:
+        fig.add_trace(
+            go.Scatter(y=actual_prices, name="Actual Prices", line=dict(color='blue')),
+            row=1, col=1
+        )
+    
+    fig.update_layout(
+        title="Price Predictions",
+        xaxis_title="Time Steps",
+        yaxis_title="Price",
+        hovermode='x unified',
+        template='plotly_dark'
+    )
+    
+    return fig
+
+def plot_portfolio_performance(portfolio_values, trades=None):
+    """Plot portfolio performance with trade markers"""
+    fig = make_subplots(rows=2, cols=1, 
+                       subplot_titles=("Portfolio Value", "Drawdown"),
+                       shared_xaxes=True,
+                       vertical_spacing=0.1)
+    
+    # Portfolio value
+    dates = [v[0] for v in portfolio_values]
+    values = [v[1] for v in portfolio_values]
+    
+    fig.add_trace(
+        go.Scatter(x=dates, y=values, name="Portfolio Value", line=dict(color='blue')),
+        row=1, col=1
+    )
+    
+    # Add trade markers if provided
+    if trades is not None:
+        for trade in trades:
+            color = 'green' if trade['profit'] > 0 else 'red'
+            fig.add_trace(
+                go.Scatter(
+                    x=[trade['timestamp']], 
+                    y=[trade['value']],
+                    mode='markers',
+                    marker=dict(color=color, size=10),
+                    name=f"{trade['type'].capitalize()} {trade['symbol']}",
+                    showlegend=False
+                ),
+                row=1, col=1
+            )
+    
+    # Drawdown
+    peaks = np.maximum.accumulate(values)
+    drawdowns = (peaks - values) / peaks * 100
+    
+    fig.add_trace(
+        go.Scatter(x=dates, y=drawdowns, 
+                  name="Drawdown", 
+                  fill='tozeroy',
+                  line=dict(color='red')),
+        row=2, col=1
+    )
+    
+    fig.update_layout(
+        height=800,
+        title="Portfolio Performance",
+        hovermode='x unified',
+        template='plotly_dark'
+    )
+    
+    fig.update_yaxes(title_text="Value ($)", row=1, col=1)
+    fig.update_yaxes(title_text="Drawdown (%)", row=2, col=1)
+    
+    return fig
 
 # 3. Modified Data Collection Function using Binance US
 def fetch_construction_data(symbols=["BTC/USDT","ETH/USDT","BNB/USDT"], 
@@ -151,8 +271,8 @@ class ConstructionDataset(Dataset):
         return len(self.sequences)
     
     def __getitem__(self, idx):
-        return (torch.FloatTensor(self.sequences[idx]), 
-                torch.FloatTensor(self.targets[idx]))
+        return (torch.FloatTensor(self.sequences[idx]).to(device), 
+                torch.FloatTensor(self.targets[idx]).to(device))
 
 class EarlyStopping:
     def __init__(self, patience=7, min_delta=0.0001):
@@ -203,10 +323,13 @@ class ConstructionLSTM(nn.Module):
 
 # 6. Training Function
 def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=0.001):
+    model = model.to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)  
     early_stopping = EarlyStopping(patience=10, min_delta=0.0001)
+    scaler = GradScaler(device_type='cuda')  # For mixed precision training
+    writer = SummaryWriter()  # For TensorBoard logging
     
     training_losses = []
     validation_losses = []
@@ -220,10 +343,16 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=0
         
         for sequences, targets in train_loader:
             optimizer.zero_grad()
-            outputs = model(sequences)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
+            
+            # Mixed precision training
+            with autocast():
+                outputs = model(sequences)
+                loss = criterion(outputs, targets)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
             total_train_loss += loss.item()
         
         avg_train_loss = total_train_loss / len(train_loader)
@@ -235,8 +364,9 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=0
         
         with torch.no_grad():
             for sequences, targets in val_loader:
-                outputs = model(sequences)
-                val_loss = criterion(outputs, targets)
+                with autocast():
+                    outputs = model(sequences)
+                    val_loss = criterion(outputs, targets)
                 total_val_loss += val_loss.item()
         
         avg_val_loss = total_val_loss / len(val_loader)
@@ -245,14 +375,19 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=0
         # Learning rate scheduling
         scheduler.step(avg_val_loss)
         
+        # TensorBoard logging
+        writer.add_scalar('Loss/train', avg_train_loss, epoch)
+        writer.add_scalar('Loss/validation', avg_val_loss, epoch)
+        writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], epoch)
+        
         # Early stopping check
         early_stopping(avg_val_loss)
         
         if (epoch + 1) % 10 == 0:
-            print(f'Epoch [{epoch+1}/{num_epochs}]')
-            print(f'Training Loss: {avg_train_loss:.4f}')
-            print(f'Validation Loss: {avg_val_loss:.4f}')
-            print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
+            logger.info(f'Epoch [{epoch+1}/{num_epochs}]')
+            logger.info(f'Training Loss: {avg_train_loss:.4f}')
+            logger.info(f'Validation Loss: {avg_val_loss:.4f}')
+            logger.info(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
         
         # Save model only if significant improvement
         if avg_val_loss < best_val_loss * (1 - min_improvement):
@@ -260,9 +395,10 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=0
             save_model(model, optimizer, epoch, avg_val_loss)
         
         if early_stopping.early_stop:
-            print(f"Early stopping triggered at epoch {epoch+1}")
+            logger.info(f"Early stopping triggered at epoch {epoch+1}")
             break
     
+    writer.close()
     return training_losses, validation_losses
 
 
@@ -517,8 +653,8 @@ class WalkForwardOptimizer:
             train_end = start_idx + self.train_window
             test_end = train_end + self.test_window
             
-            train_data = data[dates[start_idx:train_end]]
-            test_data = data[dates[train_end:test_end]]
+            train_data = data.loc[dates[start_idx:train_end]]
+            test_data  = data.loc[dates[train_end:test_end]]
             
             # Optimize parameters on training data
             study = optuna.create_study(direction='maximize')
@@ -543,15 +679,25 @@ class WalkForwardOptimizer:
     
     def _objective(self, trial, model_class, train_data, parameter_ranges):
         """Optimization objective function"""
-        # Generate parameters for this trial
-        params = {
-            param: trial.suggest_float(param, *ranges)
-            for param, ranges in parameter_ranges.items()
-        }
+        # Suggest parameters
+        raw_params = {
+        param: trial.suggest_float(param, *ranges)
+        for param, ranges in parameter_ranges.items()
+    }
+        model_params = {}
+        for p in ["hidden_size", "num_layers", "dropout"]:
+            if p in parameter_ranges:
+                model_params[p] = trial.suggest_int(p, *parameter_ranges[p])
         
         # Create and train model
-        model = model_class(**params)
-        simulator = EnhancedPaperTradingSimulator()
+        model = model_class(**model_params)
+        simulator = EnhancedPaperTradingSimulator(
+            risk_manager=RiskManager(
+            trailing_stop_pct=raw_params.get("trailing_stop_pct", 0.02),
+            risk_per_trade=raw_params.get("risk_per_trade", 0.02),
+            
+        )
+        )
         
         # Run simulation on training data
         results = simulator.simulate_trading(train_data, model)
@@ -807,15 +953,17 @@ class RegimeStrategyAdapter:
 
 # Enhanced Multi-step Forecast Function
 def multi_step_forecast(model, dataset, initial_sequence, steps=48):
+    """Enhanced multi-step forecast with GPU acceleration"""
     model.eval()
     predictions = []
     
     with torch.no_grad():
-        current_sequence = initial_sequence.clone()
+        current_sequence = initial_sequence.clone().to(device)
         
         for _ in range(steps):
-            pred = model(current_sequence)
-            predictions.append(pred.numpy()[0])
+            with autocast():
+                pred = model(current_sequence)
+            predictions.append(pred.cpu().numpy()[0])
             
             # Update sequence for next prediction
             current_sequence = torch.cat((
@@ -865,9 +1013,11 @@ def objective(trial, train_loader, val_loader):
                            hidden_size=hidden_size,
                            num_layers=num_layers,
                            dropout=dropout)
+    model = model.to(device)
     
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    scaler = GradScaler(device_type='cuda')  # For mixed precision training
     
     # Train for a few epochs
     n_epochs = 10
@@ -877,18 +1027,24 @@ def objective(trial, train_loader, val_loader):
         model.train()
         for sequences, targets in train_loader:
             optimizer.zero_grad()
-            outputs = model(sequences)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
+            
+            # Mixed precision training
+            with autocast():
+                outputs = model(sequences)
+                loss = criterion(outputs, targets)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         
         # Validation
         model.eval()
         val_loss = 0
         with torch.no_grad():
             for sequences, targets in val_loader:
-                outputs = model(sequences)
-                val_loss += criterion(outputs, targets).item()
+                with autocast():
+                    outputs = model(sequences)
+                    val_loss += criterion(outputs, targets).item()
         
         val_loss /= len(val_loader)
         if val_loss < best_val_loss:
@@ -905,7 +1061,6 @@ def calculate_confidence_interval(predictions, alpha=0.05):
 
 def calculate_risk_metrics(predictions, actual_prices, confidence_intervals=None):
     """Calculate trading risk metrics"""
-    
     returns = np.diff(predictions) / predictions[:-1]
     actual_returns = np.diff(actual_prices) / actual_prices[:-1]
     
@@ -930,7 +1085,7 @@ def calculate_risk_metrics(predictions, actual_prices, confidence_intervals=None
     if confidence_intervals is not None:
         uncertainty = np.mean(confidence_intervals[1] - confidence_intervals[0])
     
-    return {
+    metrics = {
         'Volatility': volatility,
         'Sharpe_Ratio': sharpe,
         'Max_Drawdown': max_drawdown,
@@ -939,10 +1094,11 @@ def calculate_risk_metrics(predictions, actual_prices, confidence_intervals=None
         'Prediction_Uncertainty': uncertainty,
         'Win_Rate': np.mean(np.sign(returns) == np.sign(actual_returns))
     }
+    
+    return metrics
 
 def calculate_position_size(prediction, confidence_interval, max_position=1.0, base_volatility=0.02):
     """Calculate suggested position size based on prediction confidence"""
-    
     # Calculate normalized uncertainty
     uncertainty = (confidence_interval[1] - confidence_interval[0]) / 2
     pred_volatility = uncertainty / prediction
@@ -961,12 +1117,14 @@ def calculate_position_size(prediction, confidence_interval, max_position=1.0, b
     
     final_size = risk_adjusted_size * trend_multiplier
     
-    return {
+    sizing_info = {
         'position_size': final_size,
         'confidence_score': 1 - pred_volatility/base_volatility,
         'risk_score': max_loss,
         'trend_strength': market_trend
     }
+    
+    return sizing_info
 
 class RiskManager:
     def __init__(self, trailing_stop_pct=0.02, max_drawdown_pct=0.15, 
@@ -1376,20 +1534,24 @@ def prepare_trading_data(data, predictions, ci, scaler):
     
     return actual_prices, pred_transformed, (ci_lower_transformed, ci_upper_transformed)
 
-# 7. Main Execution
 def main():
+    # Set up logging
+    logger.info("Starting trading system...")
+    logger.info(f"Using device: {device}")
+    
     # Fetch and prepare data
     try:
         data = fetch_construction_data(since_days=60)
         if len(data) == 0:
-            print("No data received, using complete sample dataset")
+            logger.warning("No data received, using complete sample dataset")
             data = create_sample_data(60)
     except Exception as e:
-        print(f"Error in data fetching: {str(e)}, using sample data")
+        logger.error(f"Error in data fetching: {str(e)}, using sample data")
         data = create_sample_data(60)
     
-    # Hyperparameter optimization
+    # Create dataset
     dataset = ConstructionDataset(data)
+    logger.info(f"Dataset created with {len(dataset)} samples")
     
     # Split data
     total_size = len(dataset)
@@ -1401,33 +1563,65 @@ def main():
         dataset, [train_size, val_size, test_size]
     )
     
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    # Create data loaders with multiple workers
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=32, 
+        shuffle=True, 
+        num_workers=4, 
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=32, 
+        shuffle=False, 
+        num_workers=4, 
+        pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=32, 
+        shuffle=False, 
+        num_workers=1, 
+        pin_memory=True
+    )
     
-    # Optimize hyperparameters
+    logger.info("Starting hyperparameter optimization...")
     study = optuna.create_study(direction='minimize')
     study.optimize(lambda trial: objective(trial, train_loader, val_loader),
                   n_trials=20)
     
     # Get best hyperparameters
     best_params = study.best_params
-    print("\nBest hyperparameters:", best_params)
+    logger.info(f"Best hyperparameters found: {best_params}")
     
     # Train model with best parameters
-    model = ConstructionLSTM(input_size=17,
-                           hidden_size=best_params['hidden_size'],
-                           num_layers=best_params['num_layers'],
-                           dropout=best_params['dropout'])
+    model = ConstructionLSTM(
+        input_size=17,
+        hidden_size=best_params['hidden_size'],
+        num_layers=best_params['num_layers'],
+        dropout=best_params['dropout']
+    ).to(device)
     
-    train_losses, val_losses = train_model(model, train_loader, val_loader,
-                                         learning_rate=best_params['learning_rate'])
+    logger.info("Starting model training...")
+    train_losses, val_losses = train_model(
+        model, 
+        train_loader, 
+        val_loader,
+        learning_rate=best_params['learning_rate']
+    )
+    
+    # Plot training curves
+    fig_losses = plot_training_curves(train_losses, val_losses)
+    fig_losses.show()
     
     # Initialize trading system
     trading_system = UnifiedTradingSystem(initial_capital=100000)
+    data = data.reset_index()
+    data = data.set_index('timestamp')
     
     # Run simulation with walk-forward optimization
+    logger.info("Starting walk-forward optimization...")
     walk_forward = WalkForwardOptimizer(train_window=30, test_window=7)
     results = walk_forward.optimize(data, model, {
         'risk_per_trade': (0.01, 0.05),
@@ -1437,35 +1631,51 @@ def main():
     })
     
     # Run final simulation with optimized parameters
+    logger.info("Running final simulation...")
     final_results = trading_system.run_simulation(data, model)
     
-    # Plot learning curves
-    plt.figure(figsize=(12, 6))
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.title('Model Learning Curves')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.show()
+    # Generate predictions for visualization
+    initial_sequence = dataset[0][0].unsqueeze(0)
+    predictions = multi_step_forecast(model, dataset, initial_sequence, steps=48)
+    
+    # Plot predictions
+    fig_predictions = plot_predictions(predictions)
+    fig_predictions.show()
+    
+    # Plot portfolio performance
+    fig_portfolio = plot_portfolio_performance(
+        final_results['portfolio_values'],
+        final_results['trade_history']
+    )
+    fig_portfolio.show()
+    
+    logger.info("Trading simulation completed successfully")
+    logger.info(f"Final portfolio value: ${final_results['final_capital']:,.2f}")
+    logger.info(f"Total return: {final_results['returns']*100:.2f}%")
+    logger.info(f"Sharpe ratio: {final_results['metrics']['sharpe_ratio']:.2f}")
+    
+    return final_results
+
+if __name__ == "__main__":
+    
+    mp.set_start_method('spawn', force=True)
+    main()
 
 # 8. Save/Load Functions
 def save_model(model, optimizer, epoch, val_loss, filepath='best_model.pth'):
+    """Save model checkpoint"""
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'val_loss': val_loss,
     }, filepath)
-    print(f"Model saved at epoch {epoch} with validation loss: {val_loss:.4f}")
+    logger.info(f"Model saved at epoch {epoch} with validation loss: {val_loss:.4f}")
 
 
 def load_model(filepath='construction_model.pth'):
+    """Load model checkpoint"""
     model = ConstructionLSTM()
     checkpoint = torch.load(filepath)
     model.load_state_dict(checkpoint['model_state_dict'])
-    return model
-
-# 9. Run Everything
-if __name__ == "__main__":
-    main()
+    return model.to(device)
