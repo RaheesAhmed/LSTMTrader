@@ -1,4 +1,4 @@
-# @title LSTMTrader
+# @title LSTMTrader v2
 
 import ccxt
 import pandas as pd
@@ -264,113 +264,519 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=0
     
     return training_losses, validation_losses
 
-class PaperTradingSimulator:
-    def __init__(self, initial_capital=100000, max_position_size=0.2):
+
+class EnhancedPaperTradingSimulator:
+    def __init__(self, initial_capital=100000):
         self.initial_capital = initial_capital
         self.capital = initial_capital
-        self.max_position_size = max_position_size
         self.positions = {}
-        self.trades = []
         self.trade_history = []
-    
-    def simulate_trading(self, predictions, confidence_intervals, actual_prices, 
-                        symbols, timestamps):
-        """Run paper trading simulation"""
+        
+        # Initialize components
+        self.risk_manager = RiskManager(
+            trailing_stop_pct=0.02,
+            max_drawdown_pct=0.15,
+            risk_per_trade=0.02,
+            volatility_scaling=True
+        )
+        
+        self.trade_rules = TradeRules(
+            confidence_threshold=0.7,
+            min_edge=0.01,
+            max_holding_period=48,
+            trend_confirmation=True
+        )
+        
+        self.analytics = PerformanceAnalytics()
+        
+    def simulate_trading(self, data, predictions, confidence_intervals, timestamps):
+        """Enhanced trading simulation with all components"""
         portfolio_values = [self.initial_capital]
+        current_regime = None
         
         for t in range(len(predictions)-1):
-            # Calculate position sizes based on prediction confidence
-            for i, symbol in enumerate(symbols):
-                pred_change = (predictions[t+1][i] - predictions[t][i]) / predictions[t][i]
-                ci_width = (confidence_intervals[1][t][i] - confidence_intervals[0][t][i])
-                confidence_score = 1 - (ci_width / predictions[t][i])
-                
-                # Position sizing
-                position_params = calculate_position_size(
-                    predictions[t][i],
-                    (confidence_intervals[0][t][i], confidence_intervals[1][t][i])
-                )
-                
-                # Trading decision
-                if abs(pred_change) > 0.001:  # Minimum change threshold
-                    if pred_change > 0 and confidence_score > 0.7:
-                        self._open_position(symbol, actual_prices[t][i], 
-                                         position_params['position_size'],
-                                         timestamps[t])
-                    elif pred_change < 0:
-                        self._close_position(symbol, actual_prices[t][i],
-                                          timestamps[t])
+            # Update market regime
+            current_regime = self.detect_market_regime(data, t)
             
-            # Calculate portfolio value
-            portfolio_value = self.capital
-            for symbol, pos in self.positions.items():
-                portfolio_value += pos['size'] * actual_prices[t][symbols.index(symbol)]
-            portfolio_values.append(portfolio_value)
+            # Adjust strategy based on regime
+            self.adjust_strategy_parameters(current_regime)
+            
+            # Portfolio optimization
+            optimal_allocations = self.optimize_portfolio(
+                predictions[t],
+                confidence_intervals,
+                data['volatility'].iloc[t]
+            )
+            
+            # Process each symbol
+            for symbol in data['symbol'].unique():
+                position_size = optimal_allocations.get(symbol, 0)
+                
+                # Check entry conditions
+                if symbol not in self.positions:
+                    if self.trade_rules.check_entry_conditions(
+                        symbol,
+                        predictions[t+1][symbol],
+                        confidence_intervals[t+1][symbol],
+                        data.loc[t, data['symbol'] == symbol]['close'].values[0],
+                        self.get_technical_indicators(data, t, symbol)
+                    ):
+                        self._open_position(
+                            symbol,
+                            data.loc[t, data['symbol'] == symbol]['close'].values[0],
+                            position_size,
+                            timestamps[t]
+                        )
+                
+                # Check exit conditions for existing positions
+                elif symbol in self.positions:
+                    exit_signal, reason = self.trade_rules.check_exit_conditions(
+                        symbol,
+                        timestamps[t],
+                        self.positions[symbol],
+                        predictions[t+1][symbol],
+                        confidence_intervals[t+1][symbol],
+                        self.risk_manager
+                    )
+                    
+                    if exit_signal:
+                        self._close_position(
+                            symbol,
+                            data.loc[t, data['symbol'] == symbol]['close'].values[0],
+                            timestamps[t],
+                            reason
+                        )
+            
+            # Calculate and record portfolio value
+            portfolio_value = self.calculate_portfolio_value(data, t)
+            self.analytics.add_portfolio_value(portfolio_value, timestamps[t])
+            
+            # Check global risk limits
+            if self.risk_manager.check_drawdown_limit(portfolio_value, self.initial_capital):
+                print(f"Maximum drawdown limit reached at {timestamps[t]}")
+                self.close_all_positions(data, t, timestamps[t])
+            
+        # Calculate final performance metrics
+        performance_metrics = self.analytics.calculate_metrics()
+        self.analytics.plot_performance()
         
         return {
-            'final_capital': portfolio_values[-1],
-            'returns': (portfolio_values[-1] - self.initial_capital) / self.initial_capital,
-            'portfolio_values': portfolio_values,
+            'metrics': performance_metrics,
             'trade_history': self.trade_history,
-            'sharpe_ratio': self._calculate_sharpe_ratio(portfolio_values),
-            'max_drawdown': self._calculate_max_drawdown(portfolio_values)
+            'portfolio_values': self.analytics.portfolio_values
         }
     
-    def _open_position(self, symbol, price, size, timestamp):
-        if symbol not in self.positions:
-            position_value = self.capital * size * self.max_position_size
-            position_size = position_value / price
-            
-            if position_value <= self.capital:
-                self.positions[symbol] = {
-                    'size': position_size,
-                    'entry_price': price,
-                    'entry_time': timestamp
-                }
-                self.capital -= position_value
-                self.trade_history.append({
-                    'type': 'buy',
-                    'symbol': symbol,
-                    'price': price,
-                    'size': position_size,
-                    'value': position_value,
-                    'timestamp': timestamp
-                })
+    def detect_market_regime(self, data, t):
+        """Detect current market regime using volatility and trend"""
+        volatility = data['volatility'].iloc[t]
+        trend = data['trend'].iloc[t]
+        
+        if volatility > data['volatility'].mean() * 1.5:
+            return 'high_volatility'
+        elif trend > 0:
+            return 'uptrend'
+        elif trend < 0:
+            return 'downtrend'
+        else:
+            return 'range_bound'
     
-    def _close_position(self, symbol, price, timestamp):
+    def adjust_strategy_parameters(self, regime):
+        """Adjust strategy parameters based on market regime"""
+        if regime == 'high_volatility':
+            self.risk_manager.risk_per_trade *= 0.5
+            self.trade_rules.confidence_threshold *= 1.2
+        elif regime == 'uptrend':
+            self.risk_manager.trailing_stop_pct *= 1.5
+            self.trade_rules.min_edge *= 0.8
+        elif regime == 'downtrend':
+            self.risk_manager.risk_per_trade *= 0.7
+            self.trade_rules.max_holding_period *= 0.5
+    
+    def optimize_portfolio(self, predictions, confidence_intervals, volatility):
+        """Optimize portfolio allocation using Modern Portfolio Theory"""
+        n_assets = len(predictions)
+        returns = np.array([(p - c[0])/c[0] for p, c in zip(predictions, confidence_intervals)])
+        
+        # Calculate covariance matrix
+        cov_matrix = np.eye(n_assets) * volatility
+        
+        # Optimize using Sharpe Ratio
+        def neg_sharpe_ratio(weights):
+            port_return = np.sum(returns * weights)
+            port_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+            return -(port_return - 0.02) / port_vol if port_vol != 0 else -float('inf')
+        
+        # Constraints
+        constraints = (
+            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},  # weights sum to 1
+            {'type': 'ineq', 'fun': lambda x: x}  # non-negative weights
+        )
+        
+        # Optimize
+        result = minimize(neg_sharpe_ratio,
+                        x0=np.array([1/n_assets]*n_assets),
+                        method='SLSQP',
+                        constraints=constraints)
+        
+        return dict(zip(range(n_assets), result.x))
+    
+    def _open_position(self, symbol, price, size, timestamp):
+        position_value = self.capital * size
+        position_size = position_value / price
+        
+        if position_value <= self.capital:
+            self.positions[symbol] = {
+                'size': position_size,
+                'entry_price': price,
+                'entry_time': timestamp
+            }
+            self.capital -= position_value
+            
+            trade = {
+                'type': 'buy',
+                'symbol': symbol,
+                'price': price,
+                'size': position_size,
+                'value': position_value,
+                'timestamp': timestamp
+            }
+            self.trade_history.append(trade)
+            self.analytics.add_trade(trade)
+    
+    def _close_position(self, symbol, price, timestamp, reason=""):
         if symbol in self.positions:
             position = self.positions[symbol]
             position_value = position['size'] * price
             self.capital += position_value
             
             profit = position_value - (position['size'] * position['entry_price'])
-            self.trade_history.append({
+            
+            trade = {
                 'type': 'sell',
                 'symbol': symbol,
                 'price': price,
                 'size': position['size'],
                 'value': position_value,
                 'profit': profit,
-                'timestamp': timestamp
-            })
+                'timestamp': timestamp,
+                'reason': reason
+            }
+            self.trade_history.append(trade)
+            self.analytics.add_trade(trade)
+            
             del self.positions[symbol]
     
-    def _calculate_sharpe_ratio(self, portfolio_values, risk_free_rate=0.02):
-        returns = np.diff(portfolio_values) / portfolio_values[:-1]
-        excess_returns = returns - risk_free_rate/252
-        return np.sqrt(252) * np.mean(excess_returns) / np.std(excess_returns)
+    def calculate_portfolio_value(self, data, t):
+        """Calculate current portfolio value"""
+        portfolio_value = self.capital
+        
+        for symbol, position in self.positions.items():
+            current_price = data.loc[t, data['symbol'] == symbol]['close'].values[0]
+            portfolio_value += position['size'] * current_price
+        
+        return portfolio_value
+
+class WalkForwardOptimizer:
+    def __init__(self, train_window=30, test_window=7, step_size=7):
+        self.train_window = train_window
+        self.test_window = test_window
+        self.step_size = step_size
+        
+    def optimize(self, data, model_class, parameter_ranges):
+        """Perform walk-forward optimization"""
+        results = []
+        dates = data.index.unique()
+        
+        for start_idx in range(0, len(dates) - self.train_window - self.test_window, self.step_size):
+            # Split data into train and test periods
+            train_end = start_idx + self.train_window
+            test_end = train_end + self.test_window
+            
+            train_data = data[dates[start_idx:train_end]]
+            test_data = data[dates[train_end:test_end]]
+            
+            # Optimize parameters on training data
+            study = optuna.create_study(direction='maximize')
+            study.optimize(lambda trial: self._objective(
+                trial, model_class, train_data, parameter_ranges
+            ), n_trials=50)
+            
+            # Test optimized parameters
+            best_params = study.best_params
+            performance = self._evaluate_parameters(
+                best_params, model_class, test_data
+            )
+            
+            results.append({
+                'period_start': dates[start_idx],
+                'period_end': dates[test_end],
+                'parameters': best_params,
+                'performance': performance
+            })
+        
+        return results
     
-    def _calculate_max_drawdown(self, portfolio_values):
-        peak = portfolio_values[0]
-        max_drawdown = 0
+    def _objective(self, trial, model_class, train_data, parameter_ranges):
+        """Optimization objective function"""
+        # Generate parameters for this trial
+        params = {
+            param: trial.suggest_float(param, *ranges)
+            for param, ranges in parameter_ranges.items()
+        }
         
-        for value in portfolio_values[1:]:
-            if value > peak:
-                peak = value
-            drawdown = (peak - value) / peak
-            max_drawdown = max(max_drawdown, drawdown)
+        # Create and train model
+        model = model_class(**params)
+        simulator = EnhancedPaperTradingSimulator()
         
-        return max_drawdown
+        # Run simulation on training data
+        results = simulator.simulate_trading(train_data, model)
+        
+        # Return Sharpe ratio as optimization target
+        return results['metrics']['sharpe_ratio']
+    
+    def _evaluate_parameters(self, params, model_class, test_data):
+        """Evaluate parameter set on test data"""
+        model = model_class(**params)
+        simulator = EnhancedPaperTradingSimulator()
+        return simulator.simulate_trading(test_data, model)
+
+
+class MarketRegimeDetector:
+    def __init__(self, window_size=20):
+        self.window_size = window_size
+        
+    def detect_regime(self, data):
+        """Detect market regime using multiple indicators"""
+        # Calculate regime indicators
+        volatility = self._calculate_volatility(data)
+        trend = self._calculate_trend(data)
+        momentum = self._calculate_momentum(data)
+        volume_profile = self._calculate_volume_profile(data)
+        
+        # Combine indicators using fuzzy logic
+        regime_scores = self._fuzzy_regime_classification(
+            volatility, trend, momentum, volume_profile
+        )
+        
+        # Return dominant regime
+        return self._get_dominant_regime(regime_scores)
+    
+    def _calculate_volatility(self, data):
+        """Calculate volatility regime"""
+        returns = data['close'].pct_change()
+        vol = returns.rolling(self.window_size).std() * np.sqrt(252)
+        vol_zscore = (vol - vol.mean()) / vol.std()
+        
+        return {
+            'high_volatility': vol_zscore > 1,
+            'normal_volatility': (-1 <= vol_zscore) & (vol_zscore <= 1),
+            'low_volatility': vol_zscore < -1
+        }
+    
+    def _calculate_trend(self, data):
+        """Calculate trend regime"""
+        sma_short = data['close'].rolling(20).mean()
+        sma_long = data['close'].rolling(50).mean()
+        macd = data.ta.macd()
+        
+        return {
+            'strong_uptrend': (sma_short > sma_long) & (macd['MACD_12_26_9'] > 0),
+            'weak_uptrend': (sma_short > sma_long) & (macd['MACD_12_26_9'] <= 0),
+            'sideways': abs(sma_short - sma_long) < data['close'].std(),
+            'weak_downtrend': (sma_short < sma_long) & (macd['MACD_12_26_9'] >= 0),
+            'strong_downtrend': (sma_short < sma_long) & (macd['MACD_12_26_9'] < 0)
+        }
+    
+    def _calculate_momentum(self, data):
+        """Calculate momentum regime"""
+        rsi = data.ta.rsi()
+        stoch = data.ta.stoch()
+        
+        return {
+            'overbought': (rsi > 70) & (stoch['STOCHk_14_3_3'] > 80),
+            'bullish_momentum': (rsi > 50) & (stoch['STOCHk_14_3_3'] > 50),
+            'neutral_momentum': (45 <= rsi) & (rsi <= 55),
+            'bearish_momentum': (rsi < 50) & (stoch['STOCHk_14_3_3'] < 50),
+            'oversold': (rsi < 30) & (stoch['STOCHk_14_3_3'] < 20)
+        }
+    
+    def _calculate_volume_profile(self, data):
+        """Calculate volume profile regime"""
+        volume_sma = data['volume'].rolling(self.window_size).mean()
+        obv = data.ta.obv()
+        
+        return {
+            'high_volume_bullish': (data['volume'] > volume_sma) & (data['close'] > data['open']),
+            'high_volume_bearish': (data['volume'] > volume_sma) & (data['close'] < data['open']),
+            'low_volume_bullish': (data['volume'] < volume_sma) & (data['close'] > data['open']),
+            'low_volume_bearish': (data['volume'] < volume_sma) & (data['close'] < data['open'])
+        }
+    
+    def _fuzzy_regime_classification(self, volatility, trend, momentum, volume_profile):
+        """Combine different indicators using fuzzy logic"""
+        regime_scores = {
+            'strong_bull_market': self._calculate_bull_score(
+                volatility, trend, momentum, volume_profile
+            ),
+            'weak_bull_market': self._calculate_weak_bull_score(
+                volatility, trend, momentum, volume_profile
+            ),
+            'neutral_market': self._calculate_neutral_score(
+                volatility, trend, momentum, volume_profile
+            ),
+            'weak_bear_market': self._calculate_weak_bear_score(
+                volatility, trend, momentum, volume_profile
+            ),
+            'strong_bear_market': self._calculate_bear_score(
+                volatility, trend, momentum, volume_profile
+            )
+        }
+        
+        return regime_scores
+    
+    def _calculate_bull_score(self, volatility, trend, momentum, volume_profile):
+        """Calculate strong bull market score"""
+        score = 0.0
+        score += 0.3 * trend['strong_uptrend'].mean()
+        score += 0.2 * momentum['bullish_momentum'].mean()
+        score += 0.2 * volume_profile['high_volume_bullish'].mean()
+        score += 0.15 * (1 - volatility['high_volatility'].mean())
+        score += 0.15 * (1 - momentum['overbought'].mean())
+        return score
+    
+    def _calculate_weak_bull_score(self, volatility, trend, momentum, volume_profile):
+        """Calculate weak bull market score"""
+        score = 0.0
+        score += 0.3 * trend['weak_uptrend'].mean()
+        score += 0.2 * momentum['bullish_momentum'].mean()
+        score += 0.2 * volume_profile['low_volume_bullish'].mean()
+        score += 0.15 * volatility['normal_volatility'].mean()
+        score += 0.15 * (1 - momentum['overbought'].mean())
+        return score
+    
+    def _calculate_neutral_score(self, volatility, trend, momentum, volume_profile):
+        """Calculate neutral market score"""
+        score = 0.0
+        score += 0.4 * trend['sideways'].mean()
+        score += 0.3 * momentum['neutral_momentum'].mean()
+        score += 0.3 * volatility['normal_volatility'].mean()
+        return score
+    
+    def _calculate_weak_bear_score(self, volatility, trend, momentum, volume_profile):
+        """Calculate weak bear market score"""
+        score = 0.0
+        score += 0.3 * trend['weak_downtrend'].mean()
+        score += 0.2 * momentum['bearish_momentum'].mean()
+        score += 0.2 * volume_profile['low_volume_bearish'].mean()
+        score += 0.15 * volatility['normal_volatility'].mean()
+        score += 0.15 * (1 - momentum['oversold'].mean())
+        return score
+    
+    def _calculate_bear_score(self, volatility, trend, momentum, volume_profile):
+        """Calculate strong bear market score"""
+        score = 0.0
+        score += 0.3 * trend['strong_downtrend'].mean()
+        score += 0.2 * momentum['bearish_momentum'].mean()
+        score += 0.2 * volume_profile['high_volume_bearish'].mean()
+        score += 0.15 * volatility['high_volatility'].mean()
+        score += 0.15 * (1 - momentum['oversold'].mean())
+        return score
+    
+    def _get_dominant_regime(self, regime_scores):
+        """Get the dominant market regime based on scores"""
+        return max(regime_scores.items(), key=lambda x: x[1])[0]
+
+class RegimeStrategyAdapter:
+    def __init__(self):
+        self.base_parameters = {
+            'risk_per_trade': 0.02,
+            'trailing_stop_pct': 0.02,
+            'confidence_threshold': 0.7,
+            'position_sizing_multiplier': 1.0,
+            'max_holding_period': 48
+        }
+        
+    def adapt_parameters(self, regime):
+        """Adapt strategy parameters based on market regime"""
+        if regime == 'strong_bull_market':
+            return {
+                'risk_per_trade': self.base_parameters['risk_per_trade'] * 1.2,
+                'trailing_stop_pct': self.base_parameters['trailing_stop_pct'] * 1.5,
+                'confidence_threshold': self.base_parameters['confidence_threshold'] * 0.9,
+                'position_sizing_multiplier': 1.2,
+                'max_holding_period': self.base_parameters['max_holding_period'] * 1.5
+            }
+        
+        elif regime == 'weak_bull_market':
+            return {
+                'risk_per_trade': self.base_parameters['risk_per_trade'] * 1.1,
+                'trailing_stop_pct': self.base_parameters['trailing_stop_pct'] * 1.2,
+                'confidence_threshold': self.base_parameters['confidence_threshold'] * 0.95,
+                'position_sizing_multiplier': 1.1,
+                'max_holding_period': self.base_parameters['max_holding_period'] * 1.2
+            }
+        
+        elif regime == 'neutral_market':
+            return self.base_parameters.copy()
+        
+        elif regime == 'weak_bear_market':
+            return {
+                'risk_per_trade': self.base_parameters['risk_per_trade'] * 0.8,
+                'trailing_stop_pct': self.base_parameters['trailing_stop_pct'] * 0.8,
+                'confidence_threshold': self.base_parameters['confidence_threshold'] * 1.1,
+                'position_sizing_multiplier': 0.8,
+                'max_holding_period': self.base_parameters['max_holding_period'] * 0.8
+            }
+        
+        elif regime == 'strong_bear_market':
+            return {
+                'risk_per_trade': self.base_parameters['risk_per_trade'] * 0.6,
+                'trailing_stop_pct': self.base_parameters['trailing_stop_pct'] * 0.6,
+                'confidence_threshold': self.base_parameters['confidence_threshold'] * 1.2,
+                'position_sizing_multiplier': 0.6,
+                'max_holding_period': self.base_parameters['max_holding_period'] * 0.6
+            }
+        
+        return self.base_parameters.copy()  # Default case
+    
+    def get_trading_rules(self, regime):
+        """Get specific trading rules based on market regime"""
+        base_rules = {
+            'min_profit_target': 0.02,
+            'max_loss': 0.02,
+            'trend_confirmation_required': True,
+            'volume_confirmation_required': True
+        }
+        
+        regime_rules = {
+            'strong_bull_market': {
+                'min_profit_target': 0.03,
+                'max_loss': 0.025,
+                'trend_confirmation_required': False,
+                'volume_confirmation_required': False
+            },
+            'weak_bull_market': {
+                'min_profit_target': 0.025,
+                'max_loss': 0.02,
+                'trend_confirmation_required': True,
+                'volume_confirmation_required': False
+            },
+            'neutral_market': base_rules,
+            'weak_bear_market': {
+                'min_profit_target': 0.015,
+                'max_loss': 0.015,
+                'trend_confirmation_required': True,
+                'volume_confirmation_required': True
+            },
+            'strong_bear_market': {
+                'min_profit_target': 0.01,
+                'max_loss': 0.01,
+                'trend_confirmation_required': True,
+                'volume_confirmation_required': True
+            }
+        }
+        
+        return regime_rules.get(regime, base_rules)
 
 # Enhanced Multi-step Forecast Function
 def multi_step_forecast(model, dataset, initial_sequence, steps=48):
@@ -535,6 +941,393 @@ def calculate_position_size(prediction, confidence_interval, max_position=1.0, b
         'trend_strength': market_trend
     }
 
+class RiskManager:
+    def __init__(self, trailing_stop_pct=0.02, max_drawdown_pct=0.15, 
+                 risk_per_trade=0.02, volatility_scaling=True):
+        self.trailing_stop_pct = trailing_stop_pct
+        self.max_drawdown_pct = max_drawdown_pct
+        self.risk_per_trade = risk_per_trade
+        self.volatility_scaling = volatility_scaling
+        self.trailing_stops = {}
+        
+    def update_trailing_stop(self, symbol, current_price, position):
+        """Update trailing stop for a position"""
+        if symbol not in self.trailing_stops:
+            self.trailing_stops[symbol] = current_price * (1 - self.trailing_stop_pct)
+        else:
+            new_stop = current_price * (1 - self.trailing_stop_pct)
+            if new_stop > self.trailing_stops[symbol]:
+                self.trailing_stops[symbol] = new_stop
+        
+        return current_price <= self.trailing_stops[symbol]
+    
+    def calculate_position_size(self, predicted_price, confidence_interval, 
+                              current_price, portfolio_value, volatility):
+        """Calculate optimal position size based on risk metrics"""
+        # Risk-adjusted position sizing
+        price_range = confidence_interval[1] - confidence_interval[0]
+        uncertainty = price_range / predicted_price
+        
+        # Volatility scaling
+        if self.volatility_scaling:
+            base_volatility = 0.02  # 2% baseline volatility
+            vol_adjustment = base_volatility / volatility
+            risk_adjusted = self.risk_per_trade * vol_adjustment
+        else:
+            risk_adjusted = self.risk_per_trade
+        
+        # Kelly Criterion adjustment
+        win_prob = 0.5 + (predicted_price - current_price) / (2 * price_range)
+        edge = (predicted_price / current_price - 1)
+        kelly_size = win_prob - (1 - win_prob) / edge if edge != 0 else 0
+        kelly_size = max(0, min(kelly_size, 0.5))  # Conservative Kelly
+        
+        # Final position size
+        position_size = portfolio_value * risk_adjusted * kelly_size
+        
+        return position_size
+    
+    def check_drawdown_limit(self, portfolio_value, initial_capital):
+        """Check if maximum drawdown limit is breached"""
+        drawdown = (initial_capital - portfolio_value) / initial_capital
+        return drawdown > self.max_drawdown_pct
+
+
+class TradeRules:
+    def __init__(self, confidence_threshold=0.7, min_edge=0.01, 
+                 max_holding_period=48, trend_confirmation=True):
+        self.confidence_threshold = confidence_threshold
+        self.min_edge = min_edge
+        self.max_holding_period = max_holding_period
+        self.trend_confirmation = trend_confirmation
+        self.positions_timing = {}
+    
+    def check_entry_conditions(self, symbol, prediction, confidence_interval, 
+                             current_price, technical_indicators):
+        """Check if entry conditions are met"""
+        # Calculate prediction confidence
+        price_range = confidence_interval[1] - confidence_interval[0]
+        confidence_score = 1 - (price_range / prediction)
+        
+        # Calculate expected edge
+        expected_return = (prediction - current_price) / current_price
+        
+        # Trend confirmation using technical indicators
+        trend_confirmed = True
+        if self.trend_confirmation:
+            sma_20 = technical_indicators['sma_20']
+            sma_50 = technical_indicators['sma_50']
+            rsi = technical_indicators['rsi']
+            trend_confirmed = (
+                current_price > sma_20 > sma_50 and  # Uptrend
+                rsi > 40 and rsi < 70  # Not overbought/oversold
+            )
+        
+        return (confidence_score > self.confidence_threshold and
+                abs(expected_return) > self.min_edge and
+                trend_confirmed)
+    
+    def check_exit_conditions(self, symbol, current_time, position_info,
+                            prediction, confidence_interval, risk_manager):
+        """Check if exit conditions are met"""
+        # Time-based exit
+        holding_time = (current_time - position_info['entry_time']).total_seconds() / 3600
+        if holding_time > self.max_holding_period:
+            return True, "Max holding period exceeded"
+        
+        # Trailing stop hit
+        if risk_manager.update_trailing_stop(symbol, prediction, position_info):
+            return True, "Trailing stop triggered"
+        
+        # Prediction reversal
+        entry_price = position_info['entry_price']
+        if prediction < entry_price * (1 - self.min_edge):
+            return True, "Prediction reversal"
+        
+        # Confidence loss
+        price_range = confidence_interval[1] - confidence_interval[0]
+        confidence_score = 1 - (price_range / prediction)
+        if confidence_score < self.confidence_threshold:
+            return True, "Low confidence"
+        
+        return False, None
+
+
+class PerformanceAnalytics:
+    def __init__(self):
+        self.daily_returns = []
+        self.trades = []
+        self.portfolio_values = []
+        
+    def add_trade(self, trade):
+        self.trades.append(trade)
+        
+    def add_portfolio_value(self, value, timestamp):
+        self.portfolio_values.append((timestamp, value))
+        
+    def calculate_metrics(self, risk_free_rate=0.02):
+        """Calculate comprehensive performance metrics"""
+        returns = np.diff([v[1] for v in self.portfolio_values]) / \
+                 np.array([v[1] for v in self.portfolio_values[:-1]])
+        
+        # Basic metrics
+        total_return = (self.portfolio_values[-1][1] / self.portfolio_values[0][1]) - 1
+        volatility = np.std(returns) * np.sqrt(252)
+        sharpe = (np.mean(returns) - risk_free_rate/252) / np.std(returns) * np.sqrt(252)
+        
+        # Drawdown analysis
+        portfolio_values = np.array([v[1] for v in self.portfolio_values])
+        peaks = np.maximum.accumulate(portfolio_values)
+        drawdowns = (peaks - portfolio_values) / peaks
+        max_drawdown = np.max(drawdowns)
+        
+        # Trade analysis
+        winning_trades = [t for t in self.trades if t['profit'] > 0]
+        losing_trades = [t for t in self.trades if t['profit'] <= 0]
+        win_rate = len(winning_trades) / len(self.trades) if self.trades else 0
+        
+        # Risk metrics
+        var_95 = np.percentile(returns, 5)
+        cvar_95 = np.mean(returns[returns <= var_95])
+        
+        return {
+            'total_return': total_return,
+            'annualized_return': total_return * (252 / len(returns)),
+            'volatility': volatility,
+            'sharpe_ratio': sharpe,
+            'max_drawdown': max_drawdown,
+            'win_rate': win_rate,
+            'avg_win': np.mean([t['profit'] for t in winning_trades]) if winning_trades else 0,
+            'avg_loss': np.mean([t['profit'] for t in losing_trades]) if losing_trades else 0,
+            'profit_factor': abs(sum(t['profit'] for t in winning_trades) / 
+                               sum(t['profit'] for t in losing_trades)) if losing_trades else float('inf'),
+            'VaR_95': var_95,
+            'CVaR_95': cvar_95
+        }
+    
+    def plot_performance(self):
+        """Generate comprehensive performance plots"""
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Portfolio value over time
+        dates = [v[0] for v in self.portfolio_values]
+        values = [v[1] for v in self.portfolio_values]
+        ax1.plot(dates, values)
+        ax1.set_title('Portfolio Value Over Time')
+        
+        # Drawdown visualization
+        peaks = np.maximum.accumulate(values)
+        drawdowns = (peaks - values) / peaks * 100
+        ax2.fill_between(dates, 0, drawdowns, color='red', alpha=0.3)
+        ax2.set_title('Drawdown (%)')
+        
+        # Return distribution
+        returns = np.diff(values) / values[:-1]
+        ax3.hist(returns, bins=50, density=True, alpha=0.7)
+        ax3.set_title('Return Distribution')
+        
+        # Trade profit/loss
+        profits = [t['profit'] for t in self.trades]
+        ax4.bar(range(len(profits)), profits)
+        ax4.set_title('Trade Profit/Loss')
+        
+        plt.tight_layout()
+        plt.show()
+
+class UnifiedTradingSystem:
+    def __init__(self, initial_capital=100000):
+        # Initialize components
+        self.regime_detector = MarketRegimeDetector()
+        self.regime_adapter = RegimeStrategyAdapter()
+        self.risk_manager = RiskManager()
+        self.performance_analytics = PerformanceAnalytics()
+        self.current_regime = None
+        self.initial_capital = initial_capital
+        
+    def run_simulation(self, data, model, prediction_steps=72):
+        """Run complete trading simulation with all components"""
+        # Prepare dataset
+        dataset = ConstructionDataset(data)
+        
+        # Generate predictions with confidence intervals
+        initial_sequence = dataset[0][0].unsqueeze(0)
+        predictions = multi_step_forecast(model, dataset, initial_sequence, steps=prediction_steps)
+        mean, ci = calculate_confidence_interval(predictions)
+        
+        # Prepare trading data
+        actual_prices, pred_transformed, ci_transformed = prepare_trading_data(
+            data, predictions, ci, dataset.scaler
+        )
+        
+        # Initialize trading simulator with advanced components
+        simulator = EnhancedPaperTradingSimulator(
+            initial_capital=self.initial_capital,
+            risk_manager=self.risk_manager,
+            regime_detector=self.regime_detector,
+            regime_adapter=self.regime_adapter,
+            performance_analytics=self.performance_analytics
+        )
+        
+        # Run simulation
+        results = simulator.simulate_trading(
+            data=data,
+            predictions=pred_transformed,
+            confidence_intervals=ci_transformed,
+            timestamps=data['timestamp'].values,
+            symbols=['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
+        )
+        
+        # Generate comprehensive analysis
+        self._generate_analysis_report(results, data)
+        
+        return results
+    
+    def _generate_analysis_report(self, results, data):
+        """Generate comprehensive trading analysis report"""
+        print("\n=== Trading Performance Report ===")
+        
+        # Overall performance metrics
+        print("\nOverall Performance:")
+        print(f"Initial Capital: ${self.initial_capital:,.2f}")
+        print(f"Final Capital: ${results['final_capital']:,.2f}")
+        print(f"Total Return: {results['returns']*100:.2f}%")
+        print(f"Sharpe Ratio: {results['metrics']['sharpe_ratio']:.2f}")
+        print(f"Maximum Drawdown: {results['metrics']['max_drawdown']*100:.2f}%")
+        
+        # Regime-specific performance
+        print("\nPerformance by Market Regime:")
+        regime_performance = self._analyze_regime_performance(results['trade_history'])
+        for regime, metrics in regime_performance.items():
+            print(f"\n{regime.replace('_', ' ').title()}:")
+            print(f"  Win Rate: {metrics['win_rate']*100:.1f}%")
+            print(f"  Profit Factor: {metrics['profit_factor']:.2f}")
+            print(f"  Average Trade: ${metrics['avg_trade']:,.2f}")
+        
+        # Risk metrics
+        print("\nRisk Metrics:")
+        print(f"Value at Risk (95%): {results['metrics']['VaR_95']*100:.2f}%")
+        print(f"Conditional VaR (95%): {results['metrics']['CVaR_95']*100:.2f}%")
+        print(f"Annualized Volatility: {results['metrics']['volatility']*100:.2f}%")
+        
+        # Generate visualization plots
+        self._plot_comprehensive_analysis(results, data)
+    
+    def _analyze_regime_performance(self, trade_history):
+        """Analyze performance metrics by market regime"""
+        regime_trades = defaultdict(list)
+        
+        for trade in trade_history:
+            regime = trade.get('regime', 'unknown')
+            regime_trades[regime].append(trade)
+        
+        regime_metrics = {}
+        for regime, trades in regime_trades.items():
+            profits = [t['profit'] for t in trades]
+            winning_trades = [p for p in profits if p > 0]
+            losing_trades = [p for p in profits if p <= 0]
+            
+            regime_metrics[regime] = {
+                'win_rate': len(winning_trades) / len(trades) if trades else 0,
+                'profit_factor': abs(sum(winning_trades) / sum(losing_trades)) if losing_trades else float('inf'),
+                'avg_trade': np.mean(profits) if profits else 0,
+                'total_trades': len(trades)
+            }
+        
+        return regime_metrics
+    
+    def _plot_comprehensive_analysis(self, results, data):
+        """Generate comprehensive analysis plots"""
+        fig = plt.figure(figsize=(20, 12))
+        gs = gridspec.GridSpec(3, 3)
+        
+        # Portfolio value and drawdown
+        ax1 = plt.subplot(gs[0, :])
+        self._plot_portfolio_performance(ax1, results['portfolio_values'])
+        
+        # Regime transitions
+        ax2 = plt.subplot(gs[1, :])
+        self._plot_regime_transitions(ax2, data)
+        
+        # Trade distribution
+        ax3 = plt.subplot(gs[2, 0])
+        self._plot_trade_distribution(ax3, results['trade_history'])
+        
+        # Position sizing
+        ax4 = plt.subplot(gs[2, 1])
+        self._plot_position_sizing(ax4, results['trade_history'])
+        
+        # Risk metrics evolution
+        ax5 = plt.subplot(gs[2, 2])
+        self._plot_risk_metrics_evolution(ax5, results)
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def _plot_portfolio_performance(self, ax, portfolio_values):
+        """Plot portfolio value and drawdown"""
+        dates = [v[0] for v in portfolio_values]
+        values = [v[1] for v in portfolio_values]
+        
+        # Plot portfolio value
+        ax.plot(dates, values, label='Portfolio Value', color='blue')
+        ax.set_title('Portfolio Performance and Drawdown')
+        ax.set_ylabel('Portfolio Value ($)')
+        
+        # Add drawdown
+        peaks = np.maximum.accumulate(values)
+        drawdowns = (peaks - values) / peaks * 100
+        ax2 = ax.twinx()
+        ax2.fill_between(dates, 0, drawdowns, alpha=0.3, color='red', label='Drawdown')
+        ax2.set_ylabel('Drawdown (%)')
+        
+        ax.legend(loc='upper left')
+        ax2.legend(loc='upper right')
+    
+    def _plot_regime_transitions(self, ax, data):
+        """Plot market regime transitions and key events"""
+        regimes = self.regime_detector.detect_regime(data)
+        dates = data.index
+        
+        # Plot regime changes
+        ax.plot(dates, regimes, label='Market Regime', marker='o')
+        ax.set_title('Market Regime Transitions')
+        ax.set_ylabel('Regime')
+        
+        # Add key events
+        for trade in self.performance_analytics.trades:
+            if trade['profit'] > 0:
+                ax.axvline(trade['timestamp'], color='green', alpha=0.2)
+            else:
+                ax.axvline(trade['timestamp'], color='red', alpha=0.2)
+    
+    def _plot_trade_distribution(self, ax, trade_history):
+        """Plot trade profit/loss distribution"""
+        profits = [t['profit'] for t in trade_history]
+        ax.hist(profits, bins=30, density=True, alpha=0.7)
+        ax.axvline(0, color='r', linestyle='--')
+        ax.set_title('Trade Profit/Loss Distribution')
+        ax.set_xlabel('Profit/Loss ($)')
+    
+    def _plot_position_sizing(self, ax, trade_history):
+        """Plot position sizing evolution"""
+        dates = [t['timestamp'] for t in trade_history]
+        sizes = [t['value'] for t in trade_history]
+        ax.scatter(dates, sizes, alpha=0.5)
+        ax.set_title('Position Sizing Evolution')
+        ax.set_ylabel('Position Size ($)')
+    
+    def _plot_risk_metrics_evolution(self, ax, results):
+        """Plot evolution of risk metrics"""
+        window = 30  # 30-day rolling window
+        returns = np.diff(results['portfolio_values']) / results['portfolio_values'][:-1]
+        vol = pd.Series(returns).rolling(window).std() * np.sqrt(252)
+        sharpe = pd.Series(returns).rolling(window).mean() / pd.Series(returns).rolling(window).std() * np.sqrt(252)
+        
+        ax.plot(vol.index, vol.values, label='Volatility')
+        ax.plot(sharpe.index, sharpe.values, label='Sharpe Ratio')
+        ax.set_title('Risk Metrics Evolution')
+        ax.legend()
+
 
 def prepare_trading_data(data, predictions, ci, scaler):
     """Prepare data for paper trading simulation"""
@@ -565,7 +1358,7 @@ def main():
         print(f"Error in data fetching: {str(e)}, using sample data")
         data = create_sample_data(60)
     
-    # Create dataset
+    # Hyperparameter optimization
     dataset = ConstructionDataset(data)
     
     # Split data
@@ -583,63 +1376,46 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     
-    # Hyperparameter tuning with Optuna
+    # Optimize hyperparameters
     study = optuna.create_study(direction='minimize')
     study.optimize(lambda trial: objective(trial, train_loader, val_loader),
                   n_trials=20)
     
     # Get best hyperparameters
     best_params = study.best_params
-    print("Best hyperparameters:", best_params)
+    print("\nBest hyperparameters:", best_params)
     
-    # Initialize model with best parameters
+    # Train model with best parameters
     model = ConstructionLSTM(input_size=17,
                            hidden_size=best_params['hidden_size'],
                            num_layers=best_params['num_layers'],
                            dropout=best_params['dropout'])
     
-    # Train model with best parameters
     train_losses, val_losses = train_model(model, train_loader, val_loader,
                                          learning_rate=best_params['learning_rate'])
     
-    # Evaluate and plot results
-    metrics = evaluate_model(model, test_loader)
-    print("\nTest Set Metrics:")
-    for metric, value in metrics.items():
-        print(f"{metric}: {value:.4f}")
+    # Initialize trading system
+    trading_system = UnifiedTradingSystem(initial_capital=100000)
     
-    # Generate predictions with confidence intervals
-    initial_sequence = dataset[0][0].unsqueeze(0)
-    predictions = multi_step_forecast(model, dataset, initial_sequence, steps=72)
-    mean, ci = calculate_confidence_interval(predictions)
+    # Run simulation with walk-forward optimization
+    walk_forward = WalkForwardOptimizer(train_window=30, test_window=7)
+    results = walk_forward.optimize(data, model, {
+        'risk_per_trade': (0.01, 0.05),
+        'trailing_stop_pct': (0.01, 0.05),
+        'confidence_threshold': (0.6, 0.9),
+        'position_sizing_multiplier': (0.5, 2.0)
+    })
     
-    # Prepare data for trading simulation
-    actual_prices, pred_transformed, ci_transformed = prepare_trading_data(
-        data, predictions, ci, dataset.scaler
-    )
+    # Run final simulation with optimized parameters
+    final_results = trading_system.run_simulation(data, model)
     
-    # Initialize and run paper trading simulation
-    simulator = PaperTradingSimulator()
-    trading_results = simulator.simulate_trading(
-        pred_transformed,
-        ci_transformed,
-        actual_prices,
-        symbols=['BTC/USDT', 'ETH/USDT', 'BNB/USDT'],
-        timestamps=data['timestamp'].values
-    )
-    
-    print("\nPaper Trading Results:")
-    print(f"Final Capital: ${trading_results['final_capital']:,.2f}")
-    print(f"Total Return: {trading_results['returns']*100:.2f}%")
-    print(f"Sharpe Ratio: {trading_results['sharpe_ratio']:.2f}")
-    print(f"Maximum Drawdown: {trading_results['max_drawdown']*100:.2f}%")
-    
-    # Plot strategy performance
+    # Plot learning curves
     plt.figure(figsize=(12, 6))
-    plt.plot(trading_results['portfolio_values'], label='Portfolio Value')
-    plt.title('Paper Trading Performance')
-    plt.xlabel('Time')
-    plt.ylabel('Portfolio Value ($)')
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.title('Model Learning Curves')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
     plt.legend()
     plt.show()
 
