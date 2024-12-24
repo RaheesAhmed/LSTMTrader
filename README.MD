@@ -32,72 +32,28 @@ pip install -r requirements.txt
 
 ## Project Structure
 
+old folder:
+
 - `custom_prediction_model.py`: Advanced model with hyperparameter optimization and risk metrics
-- ` .py`: Streamlined version for quick testing and development
 - `local_usage.py`: Example implementation and usage patterns
-- `requirements.txt`: Project dependencies
+- `requirements.txt`: Project dependencies -`simple.py`: New version of the model with improved trading logic and transaction costs for binance
 
-## Usage
+`I am testing the new version of the model with improved trading logic and transaction costs for binance so update are in the simple.py file. I have no GPU usage thats why i switch to the simpler version of it and stop working on the custom_prediction_model.py file.`
 
-### Basic Usage (simple_lstm_model.py)
+Here are the results of the backtest:
 
-```python
-from simple_lstm_model import ConstructionLSTM, fetch_construction_data, ConstructionDataset
-
-# Fetch data
-data = fetch_construction_data(symbols=["BTC/USDT"], timeframe="1h", since_days=30)
-
-# Create dataset
-dataset = ConstructionDataset(data)
-
-# Initialize and train model
-model = ConstructionLSTM()
-# ... continue with training and prediction
 ```
+Epoch 10/10, Train: 0.0060, Val: 0.0037
 
-### Advanced Usage (custom_prediction_model.py)
+Backtest Results:
+Final Capital: $1063.55
+Total Return: 6.36%
+Number of Trades: 2
+Win Rate: 50.00%
+Maximum Drawdown: 4.53%
+Total Transaction Costs: $2.06
 
-```python
-from custom_prediction_model import ConstructionLSTM, fetch_construction_data, calculate_risk_metrics
-
-# Fetch data with multiple symbols
-data = fetch_construction_data(
-    symbols=["BTC/USDT", "ETH/USDT", "BNB/USDT"],
-    timeframe="1h",
-    since_days=60
-)
-
-# Initialize model with optimized parameters
-model = ConstructionLSTM(
-    input_size=17,
-    hidden_size=128,
-    num_layers=3,
-    dropout=0.3
-)
-
-# Get predictions and risk metrics
-predictions = model.predict(data)
-risk_metrics = calculate_risk_metrics(predictions, actual_prices)
 ```
-
-## Model Comparison
-
-### custom_prediction_model.py (Advanced Version)
-
-- Hyperparameter optimization with Optuna
-- Extended technical indicators
-- Risk management features
-- Position sizing calculations
-- Confidence intervals
-- Advanced analytics
-
-### simple_lstm_model.py (Streamlined Version)
-
-- Simplified architecture
-- Basic technical indicators
-- Faster training and inference
-- Lower computational requirements
-- Suitable for quick testing
 
 ## Contributing
 

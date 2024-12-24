@@ -13,12 +13,10 @@ import pandas_ta as ta  # Added for technical indicators
 import optuna
 from sklearn.metrics import r2_score
 import scipy.stats as st
-from torch.cuda.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from loguru import logger
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from torch.amp import GradScaler
 import torch.multiprocessing as mp
 
 
@@ -26,8 +24,8 @@ import torch.multiprocessing as mp
 # Set up logger
 logger.add("trading_system.log", rotation="500 MB")
 
-# Check for GPU
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Set device to CPU
+device = torch.device("cpu")
 logger.info(f"Using device: {device}")
 
 def plot_training_curves(train_losses, val_losses):
@@ -178,6 +176,25 @@ def fetch_construction_data(symbols=["BTC/USDT","ETH/USDT","BNB/USDT"],
     return final_data
 
 
+# 8. Save/Load Functions
+def save_model(model, optimizer, epoch, val_loss, filepath='best_model.pth'):
+    """Save model checkpoint"""
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'val_loss': val_loss,
+    }, filepath)
+    logger.info(f"Model saved at epoch {epoch} with validation loss: {val_loss:.4f}")
+
+
+def load_model(filepath='construction_model.pth'):
+    """Load model checkpoint"""
+    model = ConstructionLSTM()
+    checkpoint = torch.load(filepath)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    return model.to(device)
+
 # Create sample data function
 def create_sample_data(days=30):
     """Create more realistic sample data"""
@@ -211,32 +228,112 @@ def create_sample_data(days=30):
 # Enhanced Data Preprocessing with Technical Indicators
 def add_technical_indicators(df):
     """Add technical indicators to the dataframe"""
-    df = df.reset_index(drop=True)
-
-    df['rsi'] = df.ta.rsi(length=14)
-    df['sma_20'] = df.ta.sma(length=20)
-    df['sma_50'] = df.ta.sma(length=50)
-    df['ema_20'] = df.ta.ema(length=20)
+    # Create a copy to avoid modifying the original
+    df = df.copy()
     
-    # New indicators
-    df['atr'] = df.ta.atr(length=14)
-    stoch = df.ta.stoch(length=14)
-    df['stoch_k'] = stoch['STOCHk_14_3_3']
-    df['stoch_d'] = stoch['STOCHd_14_3_3']
+    # Initialize columns with NaN
+    for col in ['rsi', 'sma_20', 'sma_50', 'ema_20', 'atr', 'stoch_k', 'stoch_d',
+               'bb_upper', 'bb_middle', 'bb_lower', 'macd', 'macd_signal']:
+        df[col] = np.nan
     
-    # Bollinger Bands
-    bb = df.ta.bbands(length=20)
-    df['bb_upper'] = bb['BBU_20_2.0']
-    df['bb_middle'] = bb['BBM_20_2.0']
-    df['bb_lower'] = bb['BBL_20_2.0']
+    # If we have multiple symbols, process each symbol separately
+    if 'symbol' in df.columns:
+        for symbol in df['symbol'].unique():
+            try:
+                symbol_data = df[df['symbol'] == symbol].copy()
+                
+                # Ensure we have numeric data
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    symbol_data[col] = pd.to_numeric(symbol_data[col], errors='coerce')
+                
+                # Calculate RSI
+                symbol_data['rsi'] = ta.rsi(symbol_data['close'].fillna(method='ffill'), length=14)
+                
+                # Calculate Moving Averages
+                symbol_data['sma_20'] = ta.sma(symbol_data['close'].fillna(method='ffill'), length=20)
+                symbol_data['sma_50'] = ta.sma(symbol_data['close'].fillna(method='ffill'), length=50)
+                symbol_data['ema_20'] = ta.ema(symbol_data['close'].fillna(method='ffill'), length=20)
+                
+                # Calculate ATR
+                symbol_data['atr'] = ta.atr(symbol_data['high'].fillna(method='ffill'), 
+                                          symbol_data['low'].fillna(method='ffill'), 
+                                          symbol_data['close'].fillna(method='ffill'), 
+                                          length=14)
+                
+                # Calculate Stochastic
+                stoch = ta.stoch(symbol_data['high'].fillna(method='ffill'), 
+                               symbol_data['low'].fillna(method='ffill'), 
+                               symbol_data['close'].fillna(method='ffill'), 
+                               length=14)
+                if stoch is not None:
+                    symbol_data['stoch_k'] = stoch['STOCHk_14_3_3']
+                    symbol_data['stoch_d'] = stoch['STOCHd_14_3_3']
+                
+                # Calculate Bollinger Bands
+                bb = ta.bbands(symbol_data['close'].fillna(method='ffill'), length=20)
+                if bb is not None:
+                    symbol_data['bb_upper'] = bb['BBU_20_2.0']
+                    symbol_data['bb_middle'] = bb['BBM_20_2.0']
+                    symbol_data['bb_lower'] = bb['BBL_20_2.0']
+                
+                # Calculate MACD
+                macd = ta.macd(symbol_data['close'].fillna(method='ffill'), fast=12, slow=26)
+                if macd is not None:
+                    symbol_data['macd'] = macd['MACD_12_26_9']
+                    symbol_data['macd_signal'] = macd['MACDs_12_26_9']
+                
+                # Update the main dataframe
+                for col in symbol_data.columns:
+                    if col in df.columns:
+                        df.loc[symbol_data.index, col] = symbol_data[col]
+                
+            except Exception as e:
+                logger.warning(f"Error calculating indicators for {symbol}: {str(e)}")
+                continue
+    else:
+        try:
+            # Single symbol case - process directly
+            # Ensure we have numeric data
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            df['rsi'] = ta.rsi(df['close'].fillna(method='ffill'), length=14)
+            df['sma_20'] = ta.sma(df['close'].fillna(method='ffill'), length=20)
+            df['sma_50'] = ta.sma(df['close'].fillna(method='ffill'), length=50)
+            df['ema_20'] = ta.ema(df['close'].fillna(method='ffill'), length=20)
+            
+            df['atr'] = ta.atr(df['high'].fillna(method='ffill'), 
+                             df['low'].fillna(method='ffill'), 
+                             df['close'].fillna(method='ffill'), 
+                             length=14)
+            
+            stoch = ta.stoch(df['high'].fillna(method='ffill'), 
+                           df['low'].fillna(method='ffill'), 
+                           df['close'].fillna(method='ffill'), 
+                           length=14)
+            if stoch is not None:
+                df['stoch_k'] = stoch['STOCHk_14_3_3']
+                df['stoch_d'] = stoch['STOCHd_14_3_3']
+            
+            bb = ta.bbands(df['close'].fillna(method='ffill'), length=20)
+            if bb is not None:
+                df['bb_upper'] = bb['BBU_20_2.0']
+                df['bb_middle'] = bb['BBM_20_2.0']
+                df['bb_lower'] = bb['BBL_20_2.0']
+            
+            macd = ta.macd(df['close'].fillna(method='ffill'), fast=12, slow=26)
+            if macd is not None:
+                df['macd'] = macd['MACD_12_26_9']
+                df['macd_signal'] = macd['MACDs_12_26_9']
+                
+        except Exception as e:
+            logger.warning(f"Error calculating indicators: {str(e)}")
     
-    # MACD
-    macd = df.ta.macd(fast=12, slow=26)
-    df['macd'] = macd['MACD_12_26_9']
-    df['macd_signal'] = macd['MACDs_12_26_9']
+    # Forward fill and then backfill any remaining NaN values
+    df = df.ffill().bfill()
     
-    df = df.ffill()
-    df = df.fillna(0)
+    # Replace any remaining NaN or infinite values with 0
+    df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
     
     return df
 
@@ -256,23 +353,43 @@ class ConstructionDataset(Dataset):
                    'bb_upper', 'bb_middle', 'bb_lower',
                    'macd', 'macd_signal', 'atr', 'stoch_k', 'stoch_d']
         
+        # Ensure all features exist in the data
+        for feature in features:
+            if feature not in data.columns:
+                data[feature] = 0
+        
+        # Scale the features
         self.scaled_data = self.scaler.fit_transform(data[features])
         
+        # Create sequences
         self.sequences = []
         self.targets = []
         
-        for i in range(len(self.scaled_data) - sequence_length):
-            sequence = self.scaled_data[i:i + sequence_length]
-            target = self.scaled_data[i + sequence_length]
-            self.sequences.append(sequence)
-            self.targets.append(target)
+        # Ensure we have enough data for at least one sequence
+        if len(self.scaled_data) > sequence_length:
+            for i in range(len(self.scaled_data) - sequence_length):
+                sequence = self.scaled_data[i:i + sequence_length]
+                target = self.scaled_data[i + sequence_length]
+                
+                # Only add if we have valid data
+                if not np.isnan(sequence).any() and not np.isnan(target).any():
+                    self.sequences.append(sequence)
+                    self.targets.append(target)
+        
+        # Convert to numpy arrays for efficiency
+        self.sequences = np.array(self.sequences)
+        self.targets = np.array(self.targets)
+        
+        logger.info(f"Created dataset with {len(self.sequences)} sequences")
     
     def __len__(self):
         return len(self.sequences)
     
     def __getitem__(self, idx):
-        return (torch.FloatTensor(self.sequences[idx]).to(device), 
-                torch.FloatTensor(self.targets[idx]).to(device))
+        if idx >= len(self.sequences):
+            raise IndexError(f"Index {idx} out of bounds for dataset with {len(self.sequences)} sequences")
+        return (torch.FloatTensor(self.sequences[idx]), 
+                torch.FloatTensor(self.targets[idx]))
 
 class EarlyStopping:
     def __init__(self, patience=7, min_delta=0.0001):
@@ -328,7 +445,6 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=0
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)  
     early_stopping = EarlyStopping(patience=10, min_delta=0.0001)
-    scaler = GradScaler(device_type='cuda')  # For mixed precision training
     writer = SummaryWriter()  # For TensorBoard logging
     
     training_losses = []
@@ -342,16 +458,13 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=0
         total_train_loss = 0
         
         for sequences, targets in train_loader:
+            sequences = sequences.to(device)
+            targets = targets.to(device)
             optimizer.zero_grad()
-            
-            # Mixed precision training
-            with autocast():
-                outputs = model(sequences)
-                loss = criterion(outputs, targets)
-            
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            outputs = model(sequences)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
             
             total_train_loss += loss.item()
         
@@ -364,9 +477,10 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=0
         
         with torch.no_grad():
             for sequences, targets in val_loader:
-                with autocast():
-                    outputs = model(sequences)
-                    val_loss = criterion(outputs, targets)
+                sequences = sequences.to(device)
+                targets = targets.to(device)
+                outputs = model(sequences)
+                val_loss = criterion(outputs, targets)
                 total_val_loss += val_loss.item()
         
         avg_val_loss = total_val_loss / len(val_loader)
@@ -431,70 +545,91 @@ class EnhancedPaperTradingSimulator:
         if 'rsi' not in data.columns:
             data = add_technical_indicators(data.copy())
         
-        for t in range(len(predictions)-1):
-            # Update market regime
-            current_regime = self.regime_detector.detect_regime(data.iloc[max(0, t-20):t+1])
-            
-            # Adjust strategy based on regime
-            strategy_params = self.regime_adapter.adapt_parameters(current_regime)
-            
-            # Portfolio optimization
-            optimal_allocations = self.optimize_portfolio(
-                predictions[t],
-                confidence_intervals,
-                data['atr'].iloc[t] if 'atr' in data else 0.02  # Default volatility if ATR not available
-            )
-            
-            # Process each symbol
-            for symbol in symbols:
-                symbol_data = data[data['symbol'] == symbol].iloc[t] if 'symbol' in data else data.iloc[t]
-                position_size = optimal_allocations.get(symbol, 0)
+        # Reset index to make sure we can properly iterate
+        data = data.reset_index(drop=True)
+        
+        # Get the number of unique timestamps
+        n_steps = min(len(predictions)-1, len(data) // len(symbols))
+        
+        for t in range(n_steps):
+            try:
+                # Update market regime using the correct slice of data
+                start_idx = max(0, t*len(symbols))
+                end_idx = (t+1)*len(symbols)
+                regime_data = data.iloc[start_idx:end_idx]
+                current_regime = self.regime_detector.detect_regime(regime_data)
                 
-                # Check entry conditions
-                if symbol not in self.positions:
-                    if self.check_entry_conditions(
-                        symbol,
-                        predictions[t+1],
-                        confidence_intervals,
-                        symbol_data['close'],
-                        symbol_data
-                    ):
-                        self._open_position(
-                            symbol,
-                            symbol_data['close'],
-                            position_size,
-                            timestamps[t]
-                        )
+                # Adjust strategy based on regime
+                strategy_params = self.regime_adapter.adapt_parameters(current_regime)
                 
-                # Check exit conditions for existing positions
-                elif symbol in self.positions:
-                    exit_signal = self.check_exit_conditions(
-                        symbol,
-                        timestamps[t],
-                        self.positions[symbol],
-                        predictions[t+1],
-                        confidence_intervals,
-                        symbol_data['close']
-                    )
+                # Portfolio optimization
+                optimal_allocations = self.optimize_portfolio(
+                    predictions[t],
+                    confidence_intervals,
+                    data['atr'].iloc[t*len(symbols)] if 'atr' in data else 0.02
+                )
+                
+                # Process each symbol
+                for i, symbol in enumerate(symbols):
+                    current_idx = t*len(symbols) + i
+                    if current_idx >= len(data):
+                        continue
+                        
+                    symbol_data = data.iloc[current_idx]
+                    position_size = optimal_allocations.get(symbol, 0)
                     
-                    if exit_signal:
-                        self._close_position(
+                    # Check entry conditions
+                    if symbol not in self.positions:
+                        if self.check_entry_conditions(
                             symbol,
+                            predictions[t+1],
+                            confidence_intervals,
                             symbol_data['close'],
-                            timestamps[t],
-                            "Strategy exit signal"
+                            symbol_data
+                        ):
+                            self._open_position(
+                                symbol,
+                                symbol_data['close'],
+                                position_size,
+                                timestamps[t] if t < len(timestamps) else timestamps[-1]
+                            )
+                    
+                    # Check exit conditions for existing positions
+                    elif symbol in self.positions:
+                        exit_signal = self.check_exit_conditions(
+                            symbol,
+                            timestamps[t] if t < len(timestamps) else timestamps[-1],
+                            self.positions[symbol],
+                            predictions[t+1],
+                            confidence_intervals,
+                            symbol_data['close']
                         )
-            
-            # Calculate and record portfolio value
-            portfolio_value = self.calculate_portfolio_value(data, t)
-            portfolio_values.append(portfolio_value)
-            self.performance_analytics.add_portfolio_value(portfolio_value, timestamps[t])
-            
-            # Check global risk limits
-            if self.risk_manager.check_drawdown_limit(portfolio_value, self.initial_capital):
-                print(f"Maximum drawdown limit reached at {timestamps[t]}")
-                self.close_all_positions(data, t, timestamps[t])
-                break
+                        
+                        if exit_signal:
+                            self._close_position(
+                                symbol,
+                                symbol_data['close'],
+                                timestamps[t] if t < len(timestamps) else timestamps[-1],
+                                "Strategy exit signal"
+                            )
+                
+                # Calculate and record portfolio value
+                portfolio_value = self.calculate_portfolio_value(data, t*len(symbols))
+                portfolio_values.append(portfolio_value)
+                self.performance_analytics.add_portfolio_value(
+                    portfolio_value,
+                    timestamps[t] if t < len(timestamps) else timestamps[-1]
+                )
+                
+                # Check global risk limits
+                if self.risk_manager.check_drawdown_limit(portfolio_value, self.initial_capital):
+                    print(f"Maximum drawdown limit reached at {timestamps[t]}")
+                    self.close_all_positions(data, t*len(symbols), timestamps[t])
+                    break
+                    
+            except Exception as e:
+                logger.warning(f"Error in simulation step {t}: {str(e)}")
+                continue
         
         # Calculate final results
         final_capital = portfolio_values[-1]
@@ -557,7 +692,13 @@ class EnhancedPaperTradingSimulator:
         if prediction < position['entry_price']:
             return True
         
-        return False
+        # Confidence loss
+        price_range = confidence_intervals[1] - confidence_intervals[0]
+        confidence_score = 1 - (price_range / prediction)
+        if confidence_score < self.confidence_threshold:
+            return True, "Low confidence"
+        
+        return False, None
     
     def optimize_portfolio(self, predictions, confidence_intervals, volatility):
         """Simple portfolio optimization based on predictions and risk"""
@@ -572,9 +713,15 @@ class EnhancedPaperTradingSimulator:
         portfolio_value = self.capital
         
         for symbol, position in self.positions.items():
-            symbol_data = data[data['symbol'] == symbol].iloc[t] if 'symbol' in data else data.iloc[t]
-            current_price = symbol_data['close']
-            portfolio_value += position['size'] * current_price
+            try:
+                symbol_idx = t + list(self.positions.keys()).index(symbol)
+                if symbol_idx < len(data):
+                    symbol_data = data.iloc[symbol_idx]
+                    current_price = symbol_data['close']
+                    portfolio_value += position['size'] * current_price
+            except Exception as e:
+                logger.warning(f"Error calculating portfolio value for {symbol}: {str(e)}")
+                continue
         
         return portfolio_value
     
@@ -629,13 +776,19 @@ class EnhancedPaperTradingSimulator:
     def close_all_positions(self, data, t, timestamp):
         """Close all open positions"""
         for symbol in list(self.positions.keys()):
-            symbol_data = data[data['symbol'] == symbol].iloc[t] if 'symbol' in data else data.iloc[t]
-            self._close_position(
-                symbol,
-                symbol_data['close'],
-                timestamp,
-                "Risk management - closing all positions"
-            )
+            try:
+                symbol_idx = t + list(self.positions.keys()).index(symbol)
+                if symbol_idx < len(data):
+                    symbol_data = data.iloc[symbol_idx]
+                    self._close_position(
+                        symbol,
+                        symbol_data['close'],
+                        timestamp,
+                        "Risk management - closing all positions"
+                    )
+            except Exception as e:
+                logger.warning(f"Error closing position for {symbol}: {str(e)}")
+                continue
 
 class WalkForwardOptimizer:
     def __init__(self, train_window=30, test_window=7, step_size=7):
@@ -643,7 +796,7 @@ class WalkForwardOptimizer:
         self.test_window = test_window
         self.step_size = step_size
         
-    def optimize(self, data, model_class, parameter_ranges):
+    def optimize(self, data, model, parameter_ranges):
         """Perform walk-forward optimization"""
         results = []
         dates = data.index.unique()
@@ -654,18 +807,18 @@ class WalkForwardOptimizer:
             test_end = train_end + self.test_window
             
             train_data = data.loc[dates[start_idx:train_end]]
-            test_data  = data.loc[dates[train_end:test_end]]
+            test_data = data.loc[dates[train_end:test_end]]
             
             # Optimize parameters on training data
-            study = optuna.create_study(direction='maximize')
+            study = optuna.create_study(direction='minimize')  # Minimize negative Sharpe ratio
             study.optimize(lambda trial: self._objective(
-                trial, model_class, train_data, parameter_ranges
-            ), n_trials=50)
+                trial, model, train_data, parameter_ranges
+            ), n_trials=20)
             
             # Test optimized parameters
             best_params = study.best_params
             performance = self._evaluate_parameters(
-                best_params, model_class, test_data
+                best_params, model, test_data
             )
             
             results.append({
@@ -675,41 +828,79 @@ class WalkForwardOptimizer:
                 'performance': performance
             })
         
-        return results
+        # Find best performing parameters across all periods
+        best_period = max(results, key=lambda x: x['performance']['metrics']['sharpe_ratio'])
+        return best_period['parameters']
     
-    def _objective(self, trial, model_class, train_data, parameter_ranges):
+    def _objective(self, trial, model, train_data, parameter_ranges):
         """Optimization objective function"""
-        # Suggest parameters
-        raw_params = {
-        param: trial.suggest_float(param, *ranges)
-        for param, ranges in parameter_ranges.items()
-    }
-        model_params = {}
-        for p in ["hidden_size", "num_layers", "dropout"]:
-            if p in parameter_ranges:
-                model_params[p] = trial.suggest_int(p, *parameter_ranges[p])
+        # Create dataset from train_data
+        dataset = ConstructionDataset(train_data)
+        train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
         
-        # Create and train model
-        model = model_class(**model_params)
+        # Suggest parameters for trading system
+        trading_params = {
+            'risk_per_trade': trial.suggest_float('risk_per_trade', 0.01, 0.05),
+            'trailing_stop_pct': trial.suggest_float('trailing_stop_pct', 0.01, 0.05),
+            'confidence_threshold': trial.suggest_float('confidence_threshold', 0.6, 0.9),
+            'position_sizing_multiplier': trial.suggest_float('position_sizing_multiplier', 0.5, 2.0)
+        }
+        
+        # Create trading simulator with suggested parameters
         simulator = EnhancedPaperTradingSimulator(
             risk_manager=RiskManager(
-            trailing_stop_pct=raw_params.get("trailing_stop_pct", 0.02),
-            risk_per_trade=raw_params.get("risk_per_trade", 0.02),
-            
-        )
+                trailing_stop_pct=trading_params['trailing_stop_pct'],
+                risk_per_trade=trading_params['risk_per_trade']
+            )
         )
         
-        # Run simulation on training data
-        results = simulator.simulate_trading(train_data, model)
+        # Get initial sequence for predictions
+        initial_sequence = dataset[0][0].unsqueeze(0)
         
-        # Return Sharpe ratio as optimization target
-        return results['metrics']['sharpe_ratio']
+        # Generate predictions
+        predictions = multi_step_forecast(model, dataset, initial_sequence, steps=48)
+        mean, ci = calculate_confidence_interval(predictions)
+        
+        # Run simulation
+        results = simulator.simulate_trading(
+            data=train_data,
+            predictions=predictions,
+            confidence_intervals=ci,
+            timestamps=train_data.index,
+            symbols=['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
+        )
+        
+        # Return negative Sharpe ratio (since Optuna minimizes)
+        return -results['metrics']['sharpe_ratio']
     
-    def _evaluate_parameters(self, params, model_class, test_data):
+    def _evaluate_parameters(self, params, model, test_data):
         """Evaluate parameter set on test data"""
-        model = model_class(**params)
-        simulator = EnhancedPaperTradingSimulator()
-        return simulator.simulate_trading(test_data, model)
+        # Create dataset from test data
+        dataset = ConstructionDataset(test_data)
+        initial_sequence = dataset[0][0].unsqueeze(0)
+        
+        # Generate predictions
+        predictions = multi_step_forecast(model, dataset, initial_sequence, steps=48)
+        mean, ci = calculate_confidence_interval(predictions)
+        
+        # Create simulator with optimized parameters
+        simulator = EnhancedPaperTradingSimulator(
+            risk_manager=RiskManager(
+                trailing_stop_pct=params['trailing_stop_pct'],
+                risk_per_trade=params['risk_per_trade']
+            )
+        )
+        
+        # Run simulation
+        results = simulator.simulate_trading(
+            data=test_data,
+            predictions=predictions,
+            confidence_intervals=ci,
+            timestamps=test_data.index,
+            symbols=['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
+        )
+        
+        return results
 
 
 class MarketRegimeDetector:
@@ -953,17 +1144,16 @@ class RegimeStrategyAdapter:
 
 # Enhanced Multi-step Forecast Function
 def multi_step_forecast(model, dataset, initial_sequence, steps=48):
-    """Enhanced multi-step forecast with GPU acceleration"""
+    """Multi-step forecast with CPU"""
     model.eval()
     predictions = []
     
     with torch.no_grad():
-        current_sequence = initial_sequence.clone().to(device)
+        current_sequence = initial_sequence.clone()
         
         for _ in range(steps):
-            with autocast():
-                pred = model(current_sequence)
-            predictions.append(pred.cpu().numpy()[0])
+            pred = model(current_sequence)
+            predictions.append(pred.numpy()[0])
             
             # Update sequence for next prediction
             current_sequence = torch.cat((
@@ -1017,7 +1207,6 @@ def objective(trial, train_loader, val_loader):
     
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    scaler = GradScaler(device_type='cuda')  # For mixed precision training
     
     # Train for a few epochs
     n_epochs = 10
@@ -1026,25 +1215,23 @@ def objective(trial, train_loader, val_loader):
     for epoch in range(n_epochs):
         model.train()
         for sequences, targets in train_loader:
+            sequences = sequences.to(device)
+            targets = targets.to(device)
             optimizer.zero_grad()
-            
-            # Mixed precision training
-            with autocast():
-                outputs = model(sequences)
-                loss = criterion(outputs, targets)
-            
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            outputs = model(sequences)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
         
         # Validation
         model.eval()
         val_loss = 0
         with torch.no_grad():
             for sequences, targets in val_loader:
-                with autocast():
-                    outputs = model(sequences)
-                    val_loss += criterion(outputs, targets).item()
+                sequences = sequences.to(device)
+                targets = targets.to(device)
+                outputs = model(sequences)
+                val_loss += criterion(outputs, targets).item()
         
         val_loss /= len(val_loader)
         if val_loss < best_val_loss:
@@ -1568,22 +1755,19 @@ def main():
         train_dataset, 
         batch_size=32, 
         shuffle=True, 
-        num_workers=4, 
-        pin_memory=True
+        num_workers=0  # Changed from 1 to 0 for CPU
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=32, 
         shuffle=False, 
-        num_workers=4, 
-        pin_memory=True
+        num_workers=0  # Changed from 1 to 0 for CPU
     )
     test_loader = DataLoader(
         test_dataset, 
         batch_size=32, 
         shuffle=False, 
-        num_workers=1, 
-        pin_memory=True
+        num_workers=0  # Changed from 1 to 0 for CPU
     )
     
     logger.info("Starting hyperparameter optimization...")
@@ -1615,23 +1799,24 @@ def main():
     fig_losses = plot_training_curves(train_losses, val_losses)
     fig_losses.show()
     
-    # Initialize trading system
-    trading_system = UnifiedTradingSystem(initial_capital=100000)
-    data = data.reset_index()
-    data = data.set_index('timestamp')
-    
     # Run simulation with walk-forward optimization
     logger.info("Starting walk-forward optimization...")
     walk_forward = WalkForwardOptimizer(train_window=30, test_window=7)
-    results = walk_forward.optimize(data, model, {
+    parameter_ranges = {
         'risk_per_trade': (0.01, 0.05),
         'trailing_stop_pct': (0.01, 0.05),
         'confidence_threshold': (0.6, 0.9),
         'position_sizing_multiplier': (0.5, 2.0)
-    })
+    }
+    results = walk_forward.optimize(data, model, parameter_ranges)
+    
+    # Log optimization results
+    logger.info("Walk-forward optimization completed")
+    logger.info(f"Best parameters found: {results}")
     
     # Run final simulation with optimized parameters
     logger.info("Running final simulation...")
+    trading_system = UnifiedTradingSystem(initial_capital=100000)
     final_results = trading_system.run_simulation(data, model)
     
     # Generate predictions for visualization
@@ -1661,21 +1846,3 @@ if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
     main()
 
-# 8. Save/Load Functions
-def save_model(model, optimizer, epoch, val_loss, filepath='best_model.pth'):
-    """Save model checkpoint"""
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'val_loss': val_loss,
-    }, filepath)
-    logger.info(f"Model saved at epoch {epoch} with validation loss: {val_loss:.4f}")
-
-
-def load_model(filepath='construction_model.pth'):
-    """Load model checkpoint"""
-    model = ConstructionLSTM()
-    checkpoint = torch.load(filepath)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    return model.to(device)
