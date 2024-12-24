@@ -86,44 +86,12 @@ def calculate_macd(prices, fast=12, slow=26, signal=9):
 # ====================================
 # 1) Fetch Data + Indicators
 # ====================================
-def fetch_binance_data(symbol="ASTR/USDT", timeframe="1h", since_days=30, testnet=False):
-    """Enhanced data fetching with testnet support."""
-    exchange = ccxt.binance({
-        'apiKey': os.getenv('BINANCE_API_KEY'),
-        'secret': os.getenv('BINANCE_API_SECRET'),
-        'enableRateLimit': True,
-        'options': {'defaultType': 'future'} if testnet else {}
-    })
-    
-    if testnet:
-        exchange.set_sandbox_mode(True)
-    
+def fetch_binance_data(symbol="ASTR/USDT", timeframe="1h", since_days=30):
+    exchange = ccxt.binance()
     since = exchange.parse8601((datetime.now() - timedelta(days=since_days)).strftime('%Y-%m-%dT%H:%M:%SZ'))
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    
-    # Calculate all technical indicators
-    df['rsi'] = calculate_rsi(df['close'].values)
-    df['ema_20'] = calculate_ema(df['close'].values)
-    macd, signal = calculate_macd(df['close'].values)
-    df['macd'] = macd
-    df['macd_signal'] = signal
-    
-    # New indicators
-    bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(df['close'].values)
-    df['bb_upper'] = bb_upper
-    df['bb_middle'] = bb_middle
-    df['bb_lower'] = bb_lower
-    
-    df['atr'] = calculate_atr(df['high'], df['low'], df['close'])
-    vol_ema, obv = calculate_volume_indicators(df['volume'], df['close'])
-    df['volume_ema'] = vol_ema
-    df['obv'] = obv
-    
-    # Drop any NaN values
-    df = df.dropna()
-    
     return df
 
 # ====================================
